@@ -22,22 +22,17 @@ services:
       pg:
         condition: service_healthy
     environment:
-      MARQUEZ_DB_HOST: pg
-      MARQUEZ_DB_PORT: 5432
-      MARQUEZ_DB_USER: marquez
-      MARQUEZ_DB_PASSWORD: marquez
-      MARQUEZ_DB: marquez
-      MARQUEZ_PORT: 5000
+      MARQUEZ_CONFIG: /app/config.yml
+    volumes:
+      - ./marquez-config.yml:/app/config.yml:ro
     ports: ["5000:5000"]
+    command: ["java","-jar","/opt/marquez/marquez.jar","server","/app/config.yml"]
+    restart: on-failure
     healthcheck:                       # ← 추가: API 헬스체크
       test: ["CMD-SHELL", "wget -qO- http://localhost:5000/api/v1/namespaces || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30
-    networks:
-      default:
-        aliases:
-          - marquez 
 
   lineage-gateway:
     build: ../lineage-gateway
@@ -49,21 +44,7 @@ services:
       marquez:
         condition: service_healthy
     ports: ["8000:8000"]
-
-  pii-scanner:
-    build: ../pii-scanner
-    container_name: dspm-pii-scanner
-    environment:
-      MARQUEZ_ENDPOINT: http://marquez:5000/api/v1/lineage
-      OL_NAMESPACE: dspm.mlops
-      TESTDATA_DIR: /data/test
-    volumes:
-      - ../testdata:/data/test:ro
-    ports: ["8100:8100"]
-    command: ["uvicorn","app:app","--host","0.0.0.0","--port","8100"]
-    depends_on:
-      marquez:
-        condition: service_healthy
+    restart: on-failure
 
   lineage-sample-producer:
     image: python:3.11-slim
@@ -86,3 +67,4 @@ services:
         done;
         exit 1
       "
+    restart: on-failure

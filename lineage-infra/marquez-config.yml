@@ -1,0 +1,16 @@
+server:
+  applicationConnectors:
+    - type: http
+      port: 5000
+  adminConnectors:
+    - type: http
+      port: 5001
+
+db:
+  driverClass: org.postgresql.Driver
+  url: jdbc:postgresql://pg:5432/marquez
+  user: marquez
+  password: marquez
+
+flyway:
+  enabled: true
