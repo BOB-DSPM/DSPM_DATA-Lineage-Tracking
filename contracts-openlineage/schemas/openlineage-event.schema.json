@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OpenLineageEvent",
+  "type": "object",
+  "required": ["eventType", "eventTime", "run", "job"],
+  "properties": {
+    "eventType": { "type": "string", "enum": ["START", "COMPLETE", "FAIL"] },
+    "eventTime": { "type": "string" },
+    "run": {
+      "type": "object",
+      "properties": {
+        "runId": { "type": "string" },
+        "facets": { "type": "object" }
+      }
+    },
+    "job": {
+      "type": "object",
+      "properties": {
+        "namespace": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "inputs": { "type": "array" },
+    "outputs": { "type": "array" }
+  }
+}
