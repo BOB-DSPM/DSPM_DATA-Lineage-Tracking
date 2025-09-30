@@ -81,8 +81,6 @@ python .\scripts\emit_minimal.py
 - 기본 입력: `.	estdata\ml	rain.csv`  
 - 잡 이름/산출물 ID는 `emit_minimal.py` 내부에서 수정 가능
 
----
-
 ## 6. 이벤트 형태(참고)
 > 실제 전송은 `lineage_emitter/emitter.py`의 `start_run(...)`, `complete_run(...)`가 알아서 구성함.
 ```json
