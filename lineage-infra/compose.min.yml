@@ -24,6 +24,8 @@ services:
     ports: ["5000:5000"] # API
     environment:
       MARQUEZ_CONFIG: /app/config.yml
+    volumes:
+      - ./marquez-config.yml:/app/config.yml:ro 
 
   lineage-gateway:
     build: ../lineage-gateway
