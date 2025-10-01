@@ -1,0 +1,15 @@
+﻿__pycache__/
+*.py[cod]
+*.egg-info/
+.venv*/
+.env
+dist/
+build/
+.DS_Store
+Thumbs.db
+
+lineage-gateway/
+lineage-infra/
+scripts/
+testdata/
+.vscode/
