@@ -1,0 +1,38 @@
+# lineage-infra/compose.min.yml
+version: "3.9"
+services:
+  pg:
+    image: postgres:16
+    container_name: dspm-lineage-pg
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marquez"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  marquez:
+    image: marquezproject/marquez:latest
+    container_name: dspm-marquez
+    depends_on:
+      pg:
+        condition: service_healthy
+    ports: ["5000:5000"] # API
+    environment:
+      MARQUEZ_CONFIG: /app/config.yml
+    volumes:
+      - ./marquez-config.yml:/app/config.yml:ro 
+
+  lineage-gateway:
+    build: ../lineage-gateway
+    container_name: dspm-lineage-gateway
+    environment:
+      MARQUEZ_API: http://marquez:5000/api/v1
+      MARQUEZ_ENDPOINT: http://marquez:5000/api/v1/lineage
+    depends_on:
+      - marquez
+    ports: ["8000:8000"]

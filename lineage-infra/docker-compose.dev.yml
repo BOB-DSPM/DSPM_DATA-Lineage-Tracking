@@ -1,0 +1,70 @@
+version: "3.9"
+services:
+  pg:
+    image: postgres:16
+    container_name: dspm-lineage-pg
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marquez"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  marquez:
+    image: marquezproject/marquez:latest
+    container_name: dspm-marquez
+    hostname: marquez 
+    depends_on:
+      pg:
+        condition: service_healthy
+    environment:
+      MARQUEZ_CONFIG: /app/config.yml
+    volumes:
+      - ./marquez-config.yml:/app/config.yml:ro
+    ports: ["5000:5000"]
+    command: ["java","-jar","/opt/marquez/marquez.jar","server","/app/config.yml"]
+    restart: on-failure
+    healthcheck:                       # ← 추가: API 헬스체크
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/api/v1/namespaces || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  lineage-gateway:
+    build: ../lineage-gateway
+    container_name: dspm-lineage-gateway
+    environment:
+      MARQUEZ_API: http://marquez:5000/api/v1
+      OL_NAMESPACE: dspm.mlops
+    depends_on:
+      marquez:
+        condition: service_healthy
+    ports: ["8000:8000"]
+    restart: on-failure
+
+  lineage-sample-producer:
+    image: python:3.11-slim
+    container_name: dspm-sample-producer
+    working_dir: /app
+    depends_on:
+      marquez:
+        condition: service_healthy
+    environment:
+      MARQUEZ_ENDPOINT: http://marquez:5000/api/v1/lineage
+    volumes:
+      - ../lineage-emitter-py:/app/emitter:ro
+      - ../testdata:/data/test:ro
+      - ./sample:/app/sample
+    command: >
+      bash -lc "
+        pip install -q requests &&
+        for i in 1 2 3 4 5; do
+          python /app/sample/send_event.py && exit 0 || echo 'retry...'; sleep 3;
+        done;
+        exit 1
+      "
+    restart: on-failure
