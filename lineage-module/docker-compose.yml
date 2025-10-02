@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: dspm-lineage-pg
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marquez -d marquez"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  marquez:
+    image: marquezproject/marquez:latest
+    container_name: dspm-marquez
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MARQUEZ_DB_HOST: postgres
+      MARQUEZ_DB_PORT: 5432
+      MARQUEZ_DB_USER: marquez
+      MARQUEZ_DB_PASSWORD: marquez
+      MARQUEZ_DB_NAME: marquez
+      # 필요시: MARQUEZ_PORT, MARQUEZ_URL 등 기본값 사용 가능
+    ports:
+      - "5000:5000"   # Marquez API (OpenLineage 수신: /api/v1/lineage)
+      - "5001:5001"   # Admin/Graph API (버전에 따라 다를 수 있음)
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-t", "1", "-O", "-", "http://localhost:5000/api/v1/namespaces"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
