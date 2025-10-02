@@ -9,7 +9,6 @@ build/
 Thumbs.db
 
 lineage-gateway/
-lineage-infra/
 scripts/
 testdata/
 .vscode/
