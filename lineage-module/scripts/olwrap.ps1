@@ -1,75 +1,79 @@
-<# 
-olwrap.ps1 - 임의 명령을 감싸 OpenLineage 이벤트 전송
-의존: PowerShell 5+ / 7+, Invoke-RestMethod, [guid]
-#>
-
 param(
   [Parameter(ValueFromRemainingArguments=$true)]
   [string[]]$Command
 )
 
-$MARQUEZ_URL = $env:MARQUEZ_URL
-if ([string]::IsNullOrEmpty($MARQUEZ_URL)) { $MARQUEZ_URL = "http://localhost:5000" }
-$ENDPOINT = $env:ENDPOINT
-if ([string]::IsNullOrEmpty($ENDPOINT)) { $ENDPOINT = "/api/v1/lineage" }
+# ---- Config ----
+$MARQUEZ_URL = $env:MARQUEZ_URL; if ([string]::IsNullOrEmpty($MARQUEZ_URL)) { $MARQUEZ_URL = "http://localhost:5000" }
+$ENDPOINT    = $env:ENDPOINT;    if ([string]::IsNullOrEmpty($ENDPOINT))    { $ENDPOINT    = "/api/v1/lineage" }
 
-$NAMESPACE = $env:NAMESPACE
-$JOB_NAME  = $env:JOB_NAME
-
-if ([string]::IsNullOrEmpty($NAMESPACE)) { throw "Set NAMESPACE" }
-if ([string]::IsNullOrEmpty($JOB_NAME))  { throw "Set JOB_NAME"  }
+$NAMESPACE = $env:NAMESPACE; if ([string]::IsNullOrEmpty($NAMESPACE)) { throw "Set NAMESPACE" }
+$JOB_NAME  = $env:JOB_NAME;  if ([string]::IsNullOrEmpty($JOB_NAME))  { throw "Set JOB_NAME"  }
 
 # JSON array strings like ["s3://...","file:///..."]
-$INPUTS_JSON  = $env:INPUTS;  if ([string]::IsNullOrEmpty($INPUTS_JSON))  { $INPUTS_JSON = "[]" }
+$INPUTS_JSON  = $env:INPUTS;  if ([string]::IsNullOrEmpty($INPUTS_JSON))  { $INPUTS_JSON  = "[]" }
 $OUTPUTS_JSON = $env:OUTPUTS; if ([string]::IsNullOrEmpty($OUTPUTS_JSON)) { $OUTPUTS_JSON = "[]" }
-$PRODUCER = $env:PRODUCER;    if ([string]::IsNullOrEmpty($PRODUCER))     { $PRODUCER = "urn:our-solution:olwrap:1.0" }
+$PRODUCER     = $env:PRODUCER;if ([string]::IsNullOrEmpty($PRODUCER))     { $PRODUCER     = "urn:our-solution:olwrap:1.0" }
 
-$RUN_ID = $env:RUN_ID
-if ([string]::IsNullOrEmpty($RUN_ID)) { $RUN_ID = [guid]::NewGuid().ToString() }
+$RUN_ID = $env:RUN_ID; if ([string]::IsNullOrEmpty($RUN_ID)) { $RUN_ID = [guid]::NewGuid().ToString() }
 
-function NowUtc {
-  return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-}
+function NowUtc { (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
 
-function ToDatasetsArray([string]$json) {
-  # PowerShell만으로 간단 치환 (복잡한 규칙은 서버에서 보강)
-  $arr = ConvertFrom-Json $json
-  $out = @()
+function Build-DatasetsJson([string]$json) {
+  $arr = ConvertFrom-Json $json  # ex) ["s3://...","file:///..."]
+  if ($null -eq $arr) { return "[]" }
+
+  $pieces = @()
   foreach ($item in $arr) {
-    if ($item -match "^s3://")     { $ns = "s3" }
-    elseif ($item -match "^file://"){ $ns = "file" }
-    elseif ($item -match "^jdbc:") { $ns = "jdbc" }
-    else                           { $ns = "unknown" }
-    $out += @{ namespace = $ns; name = $item }
+    if ($item -match "^s3://")       { $ns = "s3" }
+    elseif ($item -match "^file://") { $ns = "file" }
+    elseif ($item -match "^jdbc:")   { $ns = "jdbc" }
+    else                             { $ns = "unknown" }
+
+    # 개별 객체를 JSON 문자열로 (항상 객체)
+    $pieces += (@{ namespace = $ns; name = $item } | ConvertTo-Json -Compress)
   }
-  return ($out | ConvertTo-Json -Depth 5)
+
+  if ($pieces.Count -eq 0) { return "[]" }
+  return "[" + ($pieces -join ",") + "]"
 }
 
 function Emit-Event([string]$Type) {
-  $payload = [ordered]@{
-    eventType = $Type
-    eventTime = (NowUtc)
-    producer  = $PRODUCER
-    run       = @{ runId = $RUN_ID }
-    job       = @{ namespace = $NAMESPACE; name = $JOB_NAME }
-    inputs    = (ToDatasetsArray $INPUTS_JSON | ConvertFrom-Json)
-    outputs   = (ToDatasetsArray $OUTPUTS_JSON | ConvertFrom-Json)
-  } | ConvertTo-Json -Depth 8
+  $inputsJson  = Build-DatasetsJson $INPUTS_JSON
+  $outputsJson = Build-DatasetsJson $OUTPUTS_JSON
+
+  $eventTime = NowUtc
+
+  # 페이로드를 "문자열"로 직접 구성 → 단일 원소여도 무조건 배열 유지
+  $payload = @"
+{
+  "eventType":"$Type",
+  "eventTime":"$eventTime",
+  "producer":"$PRODUCER",
+  "run":{"runId":"$RUN_ID"},
+  "job":{"namespace":"$NAMESPACE","name":"$JOB_NAME"},
+  "inputs": $inputsJson,
+  "outputs": $outputsJson
+}
+"@
+
+  # 디버그 보고 싶으면 주석 해제
+  # Write-Host "`n--- PAYLOAD ---`n$payload`n---------------`n"
 
   Invoke-RestMethod -Method Post -Uri ($MARQUEZ_URL + $ENDPOINT) `
     -ContentType "application/json" -Body $payload | Out-Null
 }
 
+# ---- flow ----
 Emit-Event "START"
 
-# 실행
-& $Command
+if (-not $Command -or $Command.Count -eq 0) { throw "No command passed. Use: ./olwrap.ps1 -- <exe> <args...>" }
+$exe  = $Command[0]
+$args = @()
+if ($Command.Count -gt 1) { $args = $Command[1..($Command.Count-1)] }
+
+& $exe @args
 $EXIT_CODE = $LASTEXITCODE
 
-if ($EXIT_CODE -eq 0) {
-  Emit-Event "COMPLETE"
-} else {
-  Emit-Event "FAIL"
-}
-
+if ($EXIT_CODE -eq 0) { Emit-Event "COMPLETE" } else { Emit-Event "FAIL" }
 exit $EXIT_CODE

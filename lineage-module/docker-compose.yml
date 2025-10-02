@@ -23,12 +23,9 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      MARQUEZ_DB_HOST: postgres
-      MARQUEZ_DB_PORT: 5432
-      MARQUEZ_DB_USER: marquez
-      MARQUEZ_DB_PASSWORD: marquez
-      MARQUEZ_DB_NAME: marquez
-      # 필요시: MARQUEZ_PORT, MARQUEZ_URL 등 기본값 사용 가능
+      MARQUEZ_CONFIG: /etc/marquez/config.yml
+    volumes:
+      - ./marquez-config.yml:/etc/marquez/config.yml:ro
     ports:
       - "5000:5000"   # Marquez API (OpenLineage 수신: /api/v1/lineage)
       - "5001:5001"   # Admin/Graph API (버전에 따라 다를 수 있음)
