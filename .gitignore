@@ -1,0 +1,12 @@
+# Node/TypeScript build artefacts
+infra/node_modules/
+infra/dist/
+infra/cdk.out/
+
+# Python bytecode (만약 람다용 파이썬 편집 시)
+infra/lambda/__pycache__/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
