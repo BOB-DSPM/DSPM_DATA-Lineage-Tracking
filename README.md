@@ -204,4 +204,4 @@ Invoke-RestMethod -Uri "http://localhost:5000/api/v1/lineage?nodeId=$enc&depth=3
 
 - **완료된 범위**: 오픈소스(OpenLineage + Marquez)만으로 **라인리지 수집·저장·조회** 코어 구현 및 로컬 검증
 - **MLOps-무관**: 래퍼(PS1/SH)로 어떤 잡이든 즉시 이벤트 발행하여 테스트 가능
-- **대시보드-친화**: Marquez REST → 그래프/타임라인/검색 UI로 연결 긴,ㅇ
+- **대시보드-친화**: Marquez REST → 그래프/타임라인/검색 UI로 연결 가능
