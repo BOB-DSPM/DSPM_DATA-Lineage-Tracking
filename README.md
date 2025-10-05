@@ -1,11 +1,7 @@
 # SageMaker MLOps Lineage API (CDK + Lambda + API Gateway)
 
-이 저장소는 **AWS SageMaker Pipeline**의 **데이터 흐름(Lineage)** 과 **보안 메타데이터**를 추출하여
-DSPM 대시보드에서 사용할 수 있는 **JSON**으로 반환하는 **Lineage API** 기능 구현에 대한 내용입니다.
-
-백엔드는 **AWS CDK (TypeScript)**, **Amazon API Gateway**, **AWS Lambda (Python)** 로 구성됩니다.
-Lambda는 로컬에서 검증한 `lineage_dump.py`(boto3 로직)를 그대로 사용하여
-**노드/엣지/아티팩트** 그래프를 만들고, **최신 실행 정보/지표/모델 레지스트리**와 **S3 보안 메타데이터**(암호화/버저닝/퍼블릭 접근/태그)를 보강합니다.
+이 프로젝트는 **AWS SageMaker Pipeline**의 **데이터 흐름(Lineage)** 을 추출해
+프론트엔드에서 바로 사용할 수 있는 **JSON**으로 반환하는 **서버리스 API**입니다.
 
 ---
 
@@ -40,39 +36,36 @@ JSON 응답
 
 ---
 
-## 📦 디렉터리 구조
+## 📁 디렉터리 구조 (Python CDK 버전)
 
 ```
 .
-├── cdk.json
-├── package.json
-├── bin/
-│   └── lineage-api.ts               # CDK 앱 진입점
-├── lib/
-│   └── lineage-api-stack.ts         # API Gateway + Lambda + IAM 정의
-├── lambda/
-│   ├── handler.py                   # Lambda 핸들러(내부에서 lineage_dump를 호출)
-│   └── lineage_dump.py              # boto3 로직(로컬에서 검증한 최종본)
-└── README.md
+├── app.py                         # CDK 앱 진입점
+├── cdk.json                       # CDK 설정
+├── requirements.txt               # CDK/Python 의존성
+├── stacks/
+│   └── lineage_api_stack.py       # API Gateway + Lambda + IAM 정의
+└── lambda/
+    ├── handler.py                 # Lambda 핸들러(HTTP → lineage_lib 호출)
+    └── lineage_lib.py             # 로직: 그래프 구성/실행정보/메트릭/S3메타
 ```
-
-> `lineage_dump.py`는 원래 CLI로 JSON을 출력하지만, Lambda에서는 모듈로 임포트되어 **함수 형태로** 실행되어 API 응답 본문으로 반환합니다.
 
 ---
 
-## 🔐 IAM 최소 권한
+## 🔐 Lambda 실행 역할 최소 권한
 
-Lambda 실행 역할에 아래 **읽기 전용** 권한이 필요합니다.
+- **SageMaker**
+  - `sagemaker:ListPipelines`
+  - `sagemaker:GetPipeline` *(지원 리전/버전에 따라 없을 수 있음)*
+  - `sagemaker:DescribePipelineDefinitionForExecution`
+  - `sagemaker:ListPipelineExecutions`
+  - `sagemaker:ListPipelineExecutionSteps`
+  - `sagemaker:DescribeProcessingJob`
+  - `sagemaker:DescribeTrainingJob`
+- **S3 (버킷)**: `s3:GetBucketLocation`, `s3:GetBucketEncryption`, `s3:GetBucketVersioning`, `s3:GetPublicAccessBlock`, `s3:GetBucketTagging`
+- **S3 (옵션, 오브젝트)**: `s3:GetObject` (평가 리포트 JSON을 읽을 경우)
 
-- **SageMaker**: `ListPipelines`, `GetPipeline`(지원 시),  
-  `DescribePipelineDefinitionForExecution`, `ListPipelineExecutions`,
-  `ListPipelineExecutionSteps`, `DescribeProcessingJob`, `DescribeTrainingJob`
-- **S3 (버킷 수준)**: `GetBucketLocation`, `GetBucketEncryption`,
-  `GetBucketVersioning`, `GetPublicAccessBlock`, `GetBucketTagging`
-- **S3 (옵션, 개체 읽기)**: `GetObject` (평가 리포트 JSON을 읽을 때)
-
-> CDK에서 위 권한을 부여합니다. 가능하면 S3 리소스는 조직 버킷으로 **스코프 제한**하세요
-> (예: `arn:aws:s3:::my-mlops-dev2-v2-main-data` 및 필요한 prefix).
+> `stacks/lineage_api_stack.py`에서 최소 권한으로 부여하며, 가능하면 S3 리소스를 조직 버킷/프리픽스로 **제한**하세요.
 
 ---
 
