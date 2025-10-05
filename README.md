@@ -1,207 +1,260 @@
-# Data Lineage (OpenLineage + Marquez)
+# SageMaker MLOps Lineage API (CDK + Lambda + API Gateway)
 
-> MLOps 플랫폼에 관계 없이 **OpenLineage 표준 이벤트**기반으로 **Marquez**가 라인리지를 저장/버저닝/그래프화하고, **솔루션 대시보드**를 통해 Marquez **REST API**로 이를 조회·표시한다. Marquez 기본 UI는 사용하지 않으며, 저장·질의 API만 활용한다.
+이 저장소는 **AWS SageMaker Pipeline**의 **데이터 흐름(Lineage)** 과 **보안 메타데이터**를 추출하여
+DSPM 대시보드에서 사용할 수 있는 **JSON**으로 반환하는 **Lineage API** 기능 구현에 대한 내용입니다.
 
-## 목차
-- [레포지토리 구성](#레포지토리-구성)
-- [아키텍처](#아키텍처)
-- [사전 준비물](#사전-준비물)
-- [빠른 시작 (로컬 기동)](#빠른-시작-로컬-기동)
-- [이벤트 발행 래퍼 (플랫폼 무관)](#이벤트-발행-래퍼-플랫폼-무관)
-- [기능 검증 (Runs / Search / Lineage)](#기능-검증-runs--search--lineage)
-- [대시보드 연동: REST 계약](#대시보드-연동-rest-계약)
-- [컨벤션 & 확장 포인트](#컨벤션--확장-포인트)
-- [요약](#요약)
+백엔드는 **AWS CDK (TypeScript)**, **Amazon API Gateway**, **AWS Lambda (Python)** 로 구성됩니다.
+Lambda는 로컬에서 검증한 `lineage_dump.py`(boto3 로직)를 그대로 사용하여
+**노드/엣지/아티팩트** 그래프를 만들고, **최신 실행 정보/지표/모델 레지스트리**와 **S3 보안 메타데이터**(암호화/버저닝/퍼블릭 접근/태그)를 보강합니다.
 
-## 레포지토리 구성
+---
 
-```
-lineage-module/
-├─ docker-compose.yml          # 로컬 기동: PostgreSQL + Marquez(API)
-├─ marquez-config.yml          # Marquez DB/포트 설정 (컨테이너 마운트용)
-├─ scripts/
-│  ├─ olwrap.ps1               # Windows/PowerShell 범용 이벤트 래퍼
-│  └─ olwrap.sh                # Linux/macOS 범용 이벤트 래퍼
-├─ facets/
-│  └─ governance-1.0.json      # 거버넌스 커스텀 facet 스키마
-├─ docs/                       # MLOps 플랫폼별 추가 문서들
-└─ README.md
-```
+## ✨ 특징
 
-- **필수 코어**: `docker-compose.yml`, `marquez-config.yml`, `scripts/olwrap.ps1`  
-- **권장**: `scripts/olwrap.sh`(리눅스/CI 대비), `facets/governance-1.0.json`(거버넌스 표준화)
+- SageMaker **파이프라인 정의** + **최신 실행** 조회
+- **그래프 JSON** 제공: `nodes`, `edges`, `artifacts`
+- 스텝별 **실행 정보**: 상태, 시작/종료, 소요시간, Job ARN, 학습 지표 등
+- **S3 보안 메타데이터**: 암호화 방식, 버저닝, Public Access, 태그
+- 파이프라인 **요약**: 전체 상태/스텝별 카운트/총 소요시간
+- **REST API** + **CORS 허용** → 프론트에서 직접 호출 가능
+- **CDK 한 번의 명령**으로 배포
 
-## 아키텍처
+---
 
-```
-[ Producer(잡/파이프라인) ]
-     │
-     │ OpenLineage 이벤트 (HTTP/JSON: START/COMPLETE/FAIL, inputs/outputs, facets)
-     ▼
-[ Marquez API ]  ←→  [ PostgreSQL ]
-     │
-     │  Jobs / Runs / Datasets / Lineage REST
-     ▼
-[ 솔루션 대시보드 ]
-  - 라인리지 그래프(업/다운스트림)
-  - 런 타임라인/상태
-  - 데이터셋 검색/필터
+## 🧭 전체 흐름
+
+```text
+Frontend (React/Next)
+    │   GET /prod/lineage?pipeline=mlops-pipeline&includeLatestExec=true
+    ▼
+API Gateway (REST, CORS)
+    ▼
+Lambda (Python)  ── 호출 ──► SageMaker / S3 (읽기 전용)
+    │   - 파이프라인 정의/최신 실행 파싱
+    │   - 노드/엣지/아티팩트 구성
+    │   - 실행 지표 + S3 보안 메타데이터 보강
+    ▼
+JSON 응답
+    { pipeline, summary, graph: { nodes, edges, artifacts } }
 ```
 
-- **Producer**: 잡 시작/종료 시점에 **OpenLineage** 이벤트를 HTTP로 전송  
-- **Marquez**: 수신·저장·버저닝·그래프 연결(라인리지)  
-- **대시보드**: **Marquez REST**를 Pull하여 렌더(마르퀘즈 UI 미사용)
+---
 
-## 사전 준비물
+## 📦 디렉터리 구조
 
-- Docker / Docker Compose
-- Windows: PowerShell 5+ 또는 7+
-- Linux/macOS: `bash`, `curl`, `jq` (권장), `uuidgen` (권장)  
-  *macOS: `brew install jq coreutils`*
-
-`.env.example`를 참고해 `.env`를 만들면 편함
-
-```dotenv
-# .env 예시
-MARQUEZ_PORT=5000
-POSTGRES_PORT=5432
-POSTGRES_DB=marquez
-POSTGRES_USER=marquez
-POSTGRES_PASSWORD=marquez
+```
+.
+├── cdk.json
+├── package.json
+├── bin/
+│   └── lineage-api.ts               # CDK 앱 진입점
+├── lib/
+│   └── lineage-api-stack.ts         # API Gateway + Lambda + IAM 정의
+├── lambda/
+│   ├── handler.py                   # Lambda 핸들러(내부에서 lineage_dump를 호출)
+│   └── lineage_dump.py              # boto3 로직(로컬에서 검증한 최종본)
+└── README.md
 ```
 
-## 빠른 시작 (로컬 기동)
+> `lineage_dump.py`는 원래 CLI로 JSON을 출력하지만, Lambda에서는 모듈로 임포트되어 **함수 형태로** 실행되어 API 응답 본문으로 반환합니다.
 
-레포 루트(`lineage-module/`)에서:
+---
 
-```bash
-# Windows / Linux / macOS 공통
-docker compose up -d
+## 🔐 IAM 최소 권한
+
+Lambda 실행 역할에 아래 **읽기 전용** 권한이 필요합니다.
+
+- **SageMaker**: `ListPipelines`, `GetPipeline`(지원 시),  
+  `DescribePipelineDefinitionForExecution`, `ListPipelineExecutions`,
+  `ListPipelineExecutionSteps`, `DescribeProcessingJob`, `DescribeTrainingJob`
+- **S3 (버킷 수준)**: `GetBucketLocation`, `GetBucketEncryption`,
+  `GetBucketVersioning`, `GetPublicAccessBlock`, `GetBucketTagging`
+- **S3 (옵션, 개체 읽기)**: `GetObject` (평가 리포트 JSON을 읽을 때)
+
+> CDK에서 위 권한을 부여합니다. 가능하면 S3 리소스는 조직 버킷으로 **스코프 제한**하세요
+> (예: `arn:aws:s3:::my-mlops-dev2-v2-main-data` 및 필요한 prefix).
+
+---
+
+## ⚙️ API 명세
+
+**Base URL** (배포 후 CDK 출력 참고):
+
+```
+https://<apiId>.execute-api.<region>.amazonaws.com/prod
 ```
 
-기동 확인:
-> `marquez-config.yml`이 컨테이너에 마운트되어 있으며 DB 호스트는 도커 서비스명(`postgres`)를 사용한다.
-```powershell
-# Windows PowerShell
-Invoke-RestMethod -Uri "http://localhost:5000/api/v1/namespaces" -Method GET
-# → 빈 배열([]) 또는 정상 JSON이면 OK
+**엔드포인트**
+
+```
+GET /lineage
 ```
 
-## 이벤트 발행 래퍼 (플랫폼 무관)
+**쿼리 파라미터**
 
-> 래퍼는 **START → (사용자 작업 실행) → COMPLETE/FAIL** 순으로 OpenLineage 이벤트를 자동 전송한다.  
-> `INPUTS`/`OUTPUTS`는 **JSON 배열 문자열**이며, URI 스킴에 따라 dataset **namespace**가 자동 분류된다(예: `s3://…` → `s3`).
+| 이름                | 타입    | 필수 | 기본값            | 설명 |
+|---------------------|---------|------|-------------------|------|
+| `pipeline`          | string  | ✅   | -                 | SageMaker 파이프라인 이름 |
+| `region`            | string  | ❌   | `ap-northeast-2`  | 파이프라인이 있는 리전 |
+| `includeLatestExec` | boolean | ❌   | `true`            | 최신 실행(상태/지표/IO) 보강 |
+| `domain`            | string  | ❌   | -                 | (사용 시) 도메인 이름 태그로 필터 |
 
-### Windows (PowerShell)
+**성공 (200) 응답 예시**
 
-```powershell
-cd lineage-module
-
-$env:MARQUEZ_URL = "http://localhost:5000"
-$env:NAMESPACE   = "dev"                             # 잡 네임스페이스(환경/팀)
-$env:JOB_NAME    = "demo-job"                        # 잡 이름
-$env:INPUTS      = '["s3://datalake/raw/customers.parquet"]'
-$env:OUTPUTS     = '["s3://curated/customers_clean.parquet"]'
-
-# 실제 작업을 감싸서 실행: 성공 시 COMPLETE, 실패 시 FAIL 자동 전송
-./scripts/olwrap.ps1 -- powershell -Command "Set-Content -Path $env:TEMP\out.txt -Value 'ok'"
-```
-
-### Linux / macOS (Bash)
-
-```bash
-cd lineage-module
-
-export MARQUEZ_URL=http://localhost:5000
-export NAMESPACE=dev
-export JOB_NAME=demo-job
-export INPUTS='["s3://datalake/raw/customers.parquet"]'
-export OUTPUTS='["s3://curated/customers_clean.parquet"]'
-
-./scripts/olwrap.sh bash -lc 'echo ok > /tmp/out.txt'
-```
-
-## 기능 검증 (Runs / Search / Lineage)
-
-### Runs (상태 기록)
-> 참고: **Job 네임스페이스(`dev`)**와 **Dataset 네임스페이스(`s3`)**는 다를 수 있다.  
-> 데이터셋 목록은 `GET /api/v1/namespaces/s3/datasets`에서 확인된된다.
-
-```powershell
-Invoke-RestMethod -Uri "http://localhost:5000/api/v1/namespaces/dev/jobs/demo-job/runs" -Method GET
-```
-
-- **예상 결과**: 방금 실행한 Run이 보이고, `state=COMPLETED` (또는 실패 시 `FAILED`)
-
-### Search (데이터셋 인덱싱)
-
-```powershell
-Invoke-RestMethod -Uri "http://localhost:5000/api/v1/search?q=customers" -Method GET
-```
-
-- **예상 결과**:
-  - `s3://curated/customers_clean.parquet`
-  - `s3://datalake/raw/customers.parquet`  
-    가 **type=DATASET**, **namespace=s3**로 조회
-
-
-### Lineage (업/다운스트림 그래프)
-
-`/search` 응답의 `nodeId`를 사용합니다. 예:  
-`dataset:s3:s3://curated/customers_clean.parquet`
-
-```powershell
-$nodeId = "dataset:s3:s3://curated/customers_clean.parquet"
-$enc    = [System.Uri]::EscapeDataString($nodeId)
-Invoke-RestMethod -Uri "http://localhost:5000/api/v1/lineage?nodeId=$enc&depth=3" -Method GET
-```
-
-- **예상 결과**: 업스트림에 `s3://datalake/raw/customers.parquet`, 연결 잡 `demo-job` 등 노드/엣지가 표시
-
-## 대시보드 연동: REST 계약
-
-우리 솔루션 대시보드는 아래 **Marquez REST**를 Polling/Pull 방식으로 사용한다.
-
-### Jobs & Runs
-- `GET /api/v1/namespaces/{ns}/jobs`
-- `GET /api/v1/namespaces/{ns}/jobs/{job}`
-- `GET /api/v1/namespaces/{ns}/jobs/{job}/runs`
-
-### Datasets & Search
-- `GET /api/v1/namespaces/{ns}/datasets` *(예: ns=`s3`)*
-- `GET /api/v1/search?q={keyword}`
-
-### Lineage Graph
-- `GET /api/v1/lineage?nodeId=<urlencoded>&depth=K`  
-  *(nodeId 예: `dataset:s3:s3://curated/customers_clean.parquet`)*
-
-
-## 컨벤션 & 확장 포인트
-
-### 네이밍/식별자
-- `namespace`(job): `env.team.domain` (예: `prod.ds.marketing`)
-- `job.name` : `pipeline/task` (예: `feature-store/build_user_features`)
-- `runId` : UUIDv4 (재시도 정책은 팀 규칙)
-- dataset `name` : 절대식별 가능 URI (예: `s3://…`, `jdbc:…`, `file://…`)
-- `producer` : `urn:our-solution:<component>:<version>`
-
-### 거버넌스(선택 facet)
-`facets/governance-1.0.json` 스키마에 맞춰 이벤트에 facet을 첨부하면, 대시보드에서 **보호/정책**을 시각화할 수 있습니다.
-
-```json
+```jsonc
 {
-  "governance": {
-    "_schemaURL": "https://our-solution.io/facets/governance-1.0.json",
-    "pii": true,
-    "classification": "restricted",
-    "retention": "1y",
-    "encryption": "AES-256-at-rest"
+  "pipeline": { "name": "...", "arn": "...", "lastModifiedTime": "..." },
+  "summary": { "overallStatus": "Succeeded", "nodeStatus": {"Succeeded": 6}, "elapsedSec": 783 },
+  "graph": {
+    "nodes": [
+      {
+        "id": "Train",
+        "type": "Training",
+        "inputs": [{ "name": "train", "uri": "s3://..." }],
+        "outputs": [{ "name": "model_artifacts", "uri": "s3://.../model.tar.gz" }],
+        "run": {
+          "status": "Succeeded",
+          "elapsedSec": 170,
+          "jobArn": "arn:aws:sagemaker:...:training-job/...",
+          "metrics": { "validation:auc": 0.63, "train:auc": 0.72 }
+        }
+      }
+    ],
+    "edges": [{ "from": "Preprocess", "to": "Train", "via": "ref:Get" }],
+    "artifacts": [
+      {
+        "id": 8,
+        "uri": "s3://.../model.tar.gz",
+        "bucket": "my-mlops-dev2-v2-main-data",
+        "key": "pipelines/.../model.tar.gz",
+        "s3": { "encryption": "aws:kms", "versioning": "Enabled", "publicAccess": "Blocked", "tags": { "Env": "development" } }
+      }
+    ]
   }
 }
 ```
 
-## 요약
+**오류**
 
-- **완료된 범위**: 오픈소스(OpenLineage + Marquez)만으로 **라인리지 수집·저장·조회** 코어 구현 및 로컬 검증
-- **MLOps-무관**: 래퍼(PS1/SH)로 어떤 잡이든 즉시 이벤트 발행하여 테스트 가능
-- **대시보드-친화**: Marquez REST → 그래프/타임라인/검색 UI로 연결 가능
+- `400`: `{ "message": "pipeline is required" }`
+- `404`: `{ "message": "pipeline not found or domain filter mismatched" }`
+- `500`: `{ "message": "internal error", "requestId": "..." }` (CloudWatch Logs 확인)
+
+---
+
+## 🚀 배포
+
+### 준비물
+- Node.js 18+ / npm 또는 pnpm
+- AWS CDK v2 (`npm i -g aws-cdk`)
+- AWS CLI 프로파일 설정 (`aws configure`)
+- Lambda 런타임용 Python 3.11
+
+### 절차
+```bash
+# 1) 의존성 설치
+npm install
+
+# 2) (계정/리전 최초 1회) CDK 부트스트랩
+cdk bootstrap aws://<ACCOUNT_ID>/<REGION>
+
+# 3) 스택 배포
+cdk deploy LineageApiStack
+```
+
+배포가 완료되면 출력 예:
+
+```
+LineageApiStack.LineageApiEndpoint = https://<apiId>.execute-api.<region>.amazonaws.com/prod
+```
+
+---
+
+## 🧪 테스트
+
+**macOS/Linux (curl)**
+
+```bash
+curl -s "https://<apiId>.execute-api.ap-northeast-2.amazonaws.com/prod/lineage?pipeline=mlops-pipeline&includeLatestExec=true&region=ap-northeast-2" \
+  | python -m json.tool | head -n 50
+```
+
+**Windows PowerShell**
+
+```powershell
+$u = "https://<apiId>.execute-api.ap-northeast-2.amazonaws.com/prod/lineage?pipeline=mlops-pipeline&includeLatestExec=true&region=ap-northeast-2"
+Invoke-RestMethod -Uri $u -Method GET | ConvertTo-Json -Depth 10
+```
+
+**로그 확인 (CloudWatch)**
+
+```bash
+aws logs tail /aws/lambda/LineageApiFn --follow --region ap-northeast-2
+```
+
+---
+
+## 🖥️ 프론트엔드 연동
+
+가장 간단한 fetch 예시:
+
+```js
+const url = `${API}/lineage?pipeline=mlops-pipeline&includeLatestExec=true&region=ap-northeast-2`;
+const data = await fetch(url).then(r => {
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+});
+
+// data.graph.nodes / edges / artifacts 로 그래프 렌더링
+// 예: React Flow, Cytoscape, Dagre 등 사용
+```
+
+### 렌더링 팁
+- 노드 색: `run.status`(Succeeded/Executing/Failed)에 따라 구분
+- 엣지 스타일: `via` 값(`dependsOn` vs `ref:Get`)을 시각적으로 차별
+- 우측 패널: 스텝 `run` 정보, 지표, 레지스트리, 아티팩트 `s3` 메타데이터 표시
+- “Last scanned”는 노드 `run.endTime` 최대값 혹은 `pipeline.lastModifiedTime` 활용
+
+---
+
+## 🔧 설정
+
+Lambda 환경변수(선택):
+
+- `DEFAULT_REGION`: 기본 리전 오버라이드
+- `ENABLE_S3_META`: `true|false` (S3 메타데이터 보강 토글)
+- `S3_TIMEOUT_MS`: S3 클라이언트 타임아웃(선택)
+
+> CDK 예: `fn.addEnvironment('ENABLE_S3_META','true')`
+
+---
+
+## 🔒 보안 / 최소 권한
+
+- S3 권한은 **알려진 버킷/프리픽스**로 범위를 제한하세요.
+- (필요 시) VPC 연결 시 NAT/프라이빗 엔드포인트 구성 필수 (AWS API 호출 가능해야 함).
+- 쿼리 파라미터 유효성 점검(필수 파라미터 검증 포함).
+- API Gateway 레이트 리밋/캐싱 고려.
+
+---
+
+## 🛠️ 트러블슈팅
+
+- `encryption`/`publicAccess` 가 `Unknown` → Lambda 역할에 `GetBucketEncryption` 또는 `GetPublicAccessBlock` 권한이 부족하거나, 해당 리소스가 미설정일 수 있습니다.
+- `500 internal error` → CloudWatch 로그에서 스택 트레이스 확인.
+- `metrics` 비어있음 → 학습 작업이 `FinalMetricDataList`를 출력하지 않았거나 메트릭명 상이.
+- 간선 없음 → 정의에 `DependsOn`/`Get` 참조가 없을 수 있음(최신 실행 보강으로 대부분 보완).
+
+---
+
+## 🧰 로컬 검증 (선택)
+
+로컬에서 boto3로 JSON 검증이 필요하면:
+
+```bash
+python lineage_dump.py \
+  --region ap-northeast-2 \
+  --pipeline-name mlops-pipeline \
+  --include-latest-exec \
+  --out mlops-pipeline.json
+```
