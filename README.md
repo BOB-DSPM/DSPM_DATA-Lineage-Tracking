@@ -78,7 +78,7 @@ python -m pip install -r requirements.txt
 
 ### 3) 서버 실행
 ```bash
-# 방법 A: 모듈 실행(핫리로드)
+# 방법 A: 모듈 실행
 python -m uvicorn api:app --reload --port 8000
 
 # 방법 B: 파일 실행
