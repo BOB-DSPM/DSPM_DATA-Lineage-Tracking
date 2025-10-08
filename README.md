@@ -12,7 +12,7 @@
 - Evaluate 스텝 산출(`report.json`/`evaluation.json`/`metrics.json`)에서 **평가 지표** 추가 시도 (옵션)
 - S3 버킷 **보안 메타** 수집: Region / 암호화 / 버저닝 / Public Access / 태그
 - **헬스체크** 엔드포인트
-- **인벤토리**: Region → Domain → Pipeline 구조로 조회
+- **카탈로그**: Region → Domain → Pipeline 구조로 조회
 - **도메인 단위 일괄 라인리지** 및 **단일 파이프라인 라인리지** 조회
 
 ---
@@ -30,7 +30,7 @@
 
 ## 🔌 전체 동작 흐름
 
-1. 클라이언트가 `GET /inventory` 호출 → **리전별 도메인 목록** 및 **해당 도메인 태그가 매칭된 파이프라인 목록** 수신
+1. 클라이언트가 `GET /sagemaker/catalog` 호출 → **리전별 도메인 목록** 및 **해당 도메인 태그가 매칭된 파이프라인 목록** 수신
 2. 사용자에게 **리전 → 도메인**을 선택하게 함
 3. 선택된 도메인에 대해
    - 여러 파이프라인을 한 번에 보고 싶으면 `GET /lineage/by-domain`
@@ -92,8 +92,8 @@ python api.py
 # 헬스체크
 curl "http://localhost:8000/health"
 
-# (예) 인벤토리: 특정 리전만
-curl "http://localhost:8000/inventory?regions=ap-northeast-2"
+# (예) 카탈로그: 특정 리전만
+curl "http://localhost:8000/sagemaker/catalog?regions=ap-northeast-2"
 
 # (예) 도메인 단위 일괄 라인리지
 curl "http://localhost:8000/lineage/by-domain?region=ap-northeast-2&domain=<DOMAIN_NAME>&includeLatestExec=true"
@@ -115,8 +115,8 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 { "status": "ok", "version": "1.1.0" }
 ```
 
-### `GET /inventory`
-리전별 도메인/파이프라인 인벤토리.
+### `GET /sagemaker/catalog`
+리전별 도메인/파이프라인 카탈로그.
 - 쿼리:  
   - `regions` (선택) — 쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도  
   - `profile` (선택, 개발용) — 로컬 AWS 프로필명
