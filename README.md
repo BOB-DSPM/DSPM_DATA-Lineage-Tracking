@@ -12,8 +12,9 @@
 - Evaluate 스텝 산출(`report.json`/`evaluation.json`/`metrics.json`)에서 **평가 지표** 추가 시도 (옵션)
 - S3 버킷 **보안 메타** 수집: Region / 암호화 / 버저닝 / Public Access / 태그
 - **헬스체크** 엔드포인트
-- **인벤토리**: Region → Domain → Pipeline 구조로 조회
+- **카탈로그**: Region → Domain → Pipeline 구조로 조회
 - **도메인 단위 일괄 라인리지** 및 **단일 파이프라인 라인리지** 조회
+- **리전 개요**: 다수 리전을 한 번에 스캔해 `region → {domains[], pipelines[]}`로 반환
 
 ---
 
@@ -21,7 +22,7 @@
 
 ```
 .
-├─ api.py            # FastAPI 엔드포인트 (/health, /inventory, /lineage, /lineage/by-domain)
+├─ api.py            # FastAPI 엔드포인트 (/health, /sagemaker/overview, /sagemaker/catalog, /lineage, /lineage/by-domain)
 ├─ lineage.py        # boto3 로직 + get_lineage_json(), 인벤토리 유틸
 └─ requirements.txt  # 필요한 파이썬 라이브러리 목록
 ```
@@ -30,12 +31,12 @@
 
 ## 🔌 전체 동작 흐름
 
-1. 클라이언트가 `GET /inventory` 호출 → **리전별 도메인 목록** 및 **해당 도메인 태그가 매칭된 파이프라인 목록** 수신
-2. 사용자에게 **리전 → 도메인**을 선택하게 함
-3. 선택된 도메인에 대해
-   - 여러 파이프라인을 한 번에 보고 싶으면 `GET /lineage/by-domain`
-   - 특정 파이프라인만 보고 싶으면 `GET /lineage` 호출
-4. 반환 JSON의 `graph.nodes / graph.edges / graph.artifacts` 및 `summary`를 시각화/표시
+1. 페이지 초기 로딩 시 `GET /sagemaker/overview?includeLatestExec=true` 호출 → **리전별 Domain + Pipeline**을 한 번에 수신
+2. 프론트에서 지역/도메인/파이프라인을 **필터링만** 수행(재호출 없음)
+3. 사용자가 특정 파이프라인을 선택하면 `GET /lineage` 호출로 상세 그래프/요약 조회
+4. 필요 시 도메인 단위로 `GET /lineage/by-domain` 호출(해당 도메인의 모든 파이프라인 일괄)
+
+> 기존 방식(`/sagemaker/catalog`)도 유지되며, 특정 리전만 빠르게 보고 싶을 때 유용함.
 
 반환 스키마(요약):
 ```jsonc
@@ -92,8 +93,11 @@ python api.py
 # 헬스체크
 curl "http://localhost:8000/health"
 
-# (예) 인벤토리: 특정 리전만
-curl "http://localhost:8000/inventory?regions=ap-northeast-2"
+# (예) 리전 개요: 다수 리전 스캔 + 최신 실행 포함
+curl "http://localhost:8000/sagemaker/overview?includeLatestExec=true&regions=ap-northeast-2"
+
+# (예) 카탈로그: 특정 리전만
+curl "http://localhost:8000/sagemaker/catalog?regions=ap-northeast-2"
 
 # (예) 도메인 단위 일괄 라인리지
 curl "http://localhost:8000/lineage/by-domain?region=ap-northeast-2&domain=<DOMAIN_NAME>&includeLatestExec=true"
@@ -112,11 +116,44 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 ### `GET /health`
 상태 및 버전 확인.
 ```json
-{ "status": "ok", "version": "1.1.0" }
+{ "status": "ok", "version": "1.3.0" }
 ```
 
-### `GET /inventory`
-리전별 도메인/파이프라인 인벤토리.
+### `GET /sagemaker/overview`
+- 설명: 여러 리전을 한 번에 스캔하여 `region → {domains[], pipelines[]}` 구조 반환
+- 쿼리:
+  - `regions` (선택) — 쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도
+  - `includeLatestExec` (선택, 기본 `false`) — 파이프라인별 최신 실행 1건 요약 포함
+  - `profile` (선택, 개발용) — 로컬 AWS 프로필명(운영 미사용/무시 권장)
+- 응답 예시:
+```json
+{
+  "regions": [
+    {
+      "region": "ap-northeast-2",
+      "domains": [
+        {"domainId":"d-xxxx","domainArn":"...","domainName":"team-dev","status":"InService"}
+      ],
+      "pipelines": [
+        {
+          "pipelineName":"mlops-pipeline",
+          "pipelineArn":"...",
+          "created":"2025-10-05T03:12:00Z",
+          "latestExecution": {
+            "status":"Succeeded",
+            "arn":"...",
+            "startTime":"2025-10-05T03:13:00Z",
+            "lastModifiedTime":"2025-10-05T03:25:10Z"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `GET /sagemaker/catalog`
+리전별 도메인/파이프라인 카탈로그.
 - 쿼리:  
   - `regions` (선택) — 쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도  
   - `profile` (선택, 개발용) — 로컬 AWS 프로필명
@@ -221,19 +258,19 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 ## 🧑‍💻 프론트엔드 연동 예시
 
 ```js
-// 1) 인벤토리로 트리 로드
-const inv = await fetch("/inventory?regions=ap-northeast-2").then(r => r.json());
+// 1) 개요로 트리 로드(초기 1회)
+const overview = await fetch("/sagemaker/overview?includeLatestExec=true").then(r => r.json());
 
-// 2) 사용자가 리전/도메인 선택
+// 2) 사용자가 Region/Domain/Pipeline 선택 (필터는 프론트에서만)
 const region = "ap-northeast-2";
-const domain = "studio-a";
-
-// 3-a) 도메인 전체 라인리지
-const allRes = await fetch(`/lineage/by-domain?region=${region}&domain=${domain}&includeLatestExec=true`).then(r => r.json());
-
-// 3-b) 단일 파이프라인 라인리지
 const pipeline = "mlops-pipe";
-const oneRes = await fetch(`/lineage?region=${region}&pipeline=${pipeline}&domain=${domain}&includeLatestExec=true`).then(r => r.json());
+
+// 3) 단일 파이프라인 라인리지
+const oneRes = await fetch(`/lineage?region=${region}&pipeline=${pipeline}&includeLatestExec=true`).then(r => r.json());
+
+// 4) 도메인 전체 라인리지
+const domain = "studio-a";
+const allRes = await fetch(`/lineage/by-domain?region=${region}&domain=${domain}&includeLatestExec=true`).then(r => r.json());
 ```
 
 > 브라우저 CORS 에러가 발생하면 `api.py`의 CORS 설정에서 `allow_origins`에 프론트 도메인을 명시할 수 있으며, 현재 템플릿은 `*`로 열려 있음.
@@ -263,6 +300,6 @@ docker run --rm -p 8000:8000 lineage-api
 
 ## ⚠️ 주의 & 팁
 
-- 대규모 계정/리전에서 `/inventory`는 시간이 걸릴 수 있으므로, UI에서 **선택된 리전만** 요청하는 것을 권장함.
+- 대규모 계정/리전에서 전 리전 스캔은 느릴 수 있으므로 운영에서는 `ALLOWED_REGIONS`로 제한하고, `/sagemaker/overview` 캐시(`OVERVIEW_TTL_SECONDS`)를 권장함.
 - Evaluate 리포트 탐색 규칙은 `Evaluate` 스텝의 `report` 출력 경로에서 파일명을 **우선 탐색**하므로, 명명 규칙이 다르면 코드에서 조건을 맞춰야 함.
 - 프로덕션에서는 CORS 제한, 최소 권한, 모니터링/로깅, 헬스체크(현재 `/health`) 설정을 권장함.
