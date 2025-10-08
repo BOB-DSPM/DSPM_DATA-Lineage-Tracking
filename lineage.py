@@ -1,4 +1,5 @@
-import json, re, datetime as dt
+# lineage.py
+import argparse, json, sys, re, datetime as dt
 from typing import Dict, List, Any, Tuple, Optional
 import boto3
 import botocore
@@ -11,6 +12,9 @@ _REF_RE = re.compile(r"Steps\.([A-Za-z0-9\-_]+)")
 _S3_RE  = re.compile(r"^s3://([^/]+)/?(.*)$")
 
 def _extract_ref_step(ref: dict | str) -> str | None:
+    """
+    {"Get":"Steps.Preprocess...."} -> "Preprocess" 같은 source step 이름 추출
+    """
     if isinstance(ref, dict):
         ref = ref.get("Get") or ref.get("Std:Ref") or ""
     if not isinstance(ref, str):
@@ -22,7 +26,7 @@ def _s3_split(uri: str) -> Tuple[Optional[str], Optional[str]]:
     if not isinstance(uri, str): return None, None
     m = _S3_RE.match(uri)
     if not m: return None, None
-    return m.group(1), m.group(2)
+    return m.group(1), m.group(2)  # bucket, key
 
 def _iso(s) -> str:
     return s.isoformat() if hasattr(s, "isoformat") else str(s)
@@ -78,12 +82,18 @@ def get_latest_execution_arn(sm, pipeline_name: str) -> str | None:
     return ex[0]["PipelineExecutionArn"] if ex else None
 
 def get_pipeline_definition(sm, pipeline_name: str) -> dict:
+    """
+    1) get_pipeline (가능하면) → PipelineDefinition* 키 탐색
+    2) 없으면 최신 실행으로 describe_pipeline_definition_for_execution
+    """
     def _as_dict(v):
         if isinstance(v, dict): return v
         if isinstance(v, str):
             try: return json.loads(v)
             except Exception: return {}
         return {}
+
+    # (A) get_pipeline: 일부 오래된 boto3엔 없을 수 있으니 try만
     try:
         r = sm.get_pipeline(PipelineName=pipeline_name)
         for k in ("PipelineDefinition", "PipelineDefinitionDocument", "PipelineDefinitionBody"):
@@ -93,7 +103,9 @@ def get_pipeline_definition(sm, pipeline_name: str) -> dict:
                 if isinstance(d.get("PipelineDefinition"), dict) and d["PipelineDefinition"].get("Steps"):
                     return d["PipelineDefinition"]
     except Exception as e:
-        print(f"[warn] get_pipeline failed: {e}")
+        print(f"[warn] get_pipeline failed: {e}", file=sys.stderr)
+
+    # (B) 최신 실행 정의
     try:
         arn = get_latest_execution_arn(sm, pipeline_name)
         if arn:
@@ -104,7 +116,8 @@ def get_pipeline_definition(sm, pipeline_name: str) -> dict:
                 return d["PipelineDefinition"]
             return d
     except Exception as e:
-        print(f"[warn] describe_pipeline_definition_for_execution failed: {e}")
+        print(f"[warn] describe_pipeline_definition_for_execution failed: {e}", file=sys.stderr)
+
     return {}
 
 # ---------------------------
@@ -115,9 +128,12 @@ def normalize_step_io(step: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[
     stype = step.get("Type")
     args  = step.get("Arguments", {})
     inputs, outputs = [], []
+
     def add(uri: Optional[Any], io_type: str, name: str):
+        # uri: str (s3) 또는 dict(ref) 모두 허용
         if uri is None: return
         (inputs if io_type == "input" else outputs).append({"name": name, "uri": uri})
+
     if stype == "Processing":
         for pin in args.get("ProcessingInputs", []):
             nm = pin.get("InputName") or "input"
@@ -127,6 +143,7 @@ def normalize_step_io(step: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[
             nm = pout.get("OutputName") or "output"
             s3 = (pout.get("S3Output") or {}).get("S3Uri")
             add(s3, "output", nm)
+
     elif stype == "Training":
         tjd = args.get("TrainingJobDefinition", {})
         for ch in tjd.get("InputDataConfig", []):
@@ -135,15 +152,18 @@ def normalize_step_io(step: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[
             add(s3, "input", nm)
         s3out = (tjd.get("OutputDataConfig") or {}).get("S3OutputPath")
         add(s3out, "output", "model_artifacts")
+
     elif stype == "Transform":
         td = args.get("TransformJobDefinition", {})
         s3i = (((td.get("TransformInput") or {}).get("DataSource") or {}).get("S3DataSource") or {}).get("S3Uri")
         add(s3i, "input", "transform_input")
         s3o = (td.get("TransformOutput") or {}).get("S3OutputPath")
         add(s3o, "output", "transform_output")
+
     elif stype in ("ModelStep", "RegisterModel"):
         in_model = (args.get("Model").get("PrimaryContainer") or {}).get("ModelDataUrl") if args.get("Model") else None
         add(in_model, "input", "model_data")
+
     return inputs, outputs
 
 # ---------------------------
@@ -157,6 +177,7 @@ def build_graph_from_definition(pdef: Dict[str, Any]) -> Dict[str, Any]:
         or (pdef.get("Definition") or {}).get("Steps")
         or []
     )
+
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     artifacts: List[Dict[str, Any]] = []
@@ -246,6 +267,7 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
 
             meta = st.get("Metadata") or {}
 
+            # Processing
             pjob_arn = (meta.get("ProcessingJob") or {}).get("Arn")
             if pjob_arn:
                 pj_name = pjob_arn.split("/")[-1]
@@ -264,12 +286,14 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
                 if inps: node["inputs"]  = inps
                 if outs: node["outputs"] = outs
 
+            # Training
             tjob_arn = (meta.get("TrainingJob") or {}).get("Arn")
             if tjob_arn:
                 tj_name = tjob_arn.split("/")[-1]
                 dj = sm.describe_training_job(TrainingJobName=tj_name)
                 node["run"]["jobArn"]  = dj.get("TrainingJobArn")
                 node["run"]["jobName"] = dj.get("TrainingJobName")
+
                 metrics = {}
                 for m in dj.get("FinalMetricDataList", []):
                     n = m.get("MetricName"); v = m.get("Value")
@@ -277,6 +301,7 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
                         metrics[n] = v
                 if metrics:
                     node["run"]["metrics"] = metrics
+
                 inps, outs = [], []
                 for ch in dj.get("InputDataConfig", []):
                     nm = ch.get("ChannelName") or "channel"
@@ -287,11 +312,13 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
                 if inps: node["inputs"]  = inps
                 if outs: node["outputs"] = outs
 
+            # Model registry (RegisterModel step)
             model_pkg_arn = (meta.get("Model") or {}).get("ModelPackageArn") or \
                             (meta.get("RegisterModel") or {}).get("Arn")
             if model_pkg_arn:
                 node.setdefault("registry", {})["modelPackageArn"] = model_pkg_arn
 
+        # artifacts 재계산
         seen, artifacts = set(), []
         aid = 0
         for n in graph["nodes"]:
@@ -305,34 +332,39 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
         graph["artifacts"] = artifacts
 
     except Exception as e:
-        print(f"[warn] enrich failed: {e}")
+        print(f"[warn] enrich failed: {e}", file=sys.stderr)
 
 # ---------------------------
-# (1) Edges de-dup & label cleanup
+# (1) Edges de-dup & label cleanup (remove 'code', 'input-*')
 # ---------------------------
 
 def dedupe_and_label_edges(graph: Dict[str, Any]) -> None:
     seen = set()
     new_edges = []
+
+    # to-node 기준 입력 이름 수집
     input_names: Dict[str, List[str]] = {}
     for n in graph["nodes"]:
         n_ins = [i.get("name") for i in n.get("inputs", []) if i.get("name")]
         if n_ins:
             input_names[n["id"]] = n_ins
+
     for e in graph["edges"]:
         key = (e["from"], e["to"], e.get("via"))
         if key in seen:
             continue
         seen.add(key)
+        # 라벨 후보
         names = input_names.get(e["to"], [])
         names = [x for x in names if x != "code" and not str(x).startswith("input-")]
         if names:
             e["label"] = ", ".join(sorted(set(names))[:2])
         new_edges.append(e)
+
     graph["edges"] = new_edges
 
 # ---------------------------
-# (2) Pipeline summary
+# (2) Pipeline summary (overall status / totals)
 # ---------------------------
 
 def pipeline_summary(graph: Dict[str, Any]) -> Dict[str, Any]:
@@ -359,13 +391,14 @@ def pipeline_summary(graph: Dict[str, Any]) -> Dict[str, Any]:
     return {"overallStatus": overall, "nodeStatus": status_counts, "elapsedSec": total}
 
 # ---------------------------
-# (3) Evaluate report metrics from S3
+# (3) Evaluate report metrics from S3 (best-effort)
 # ---------------------------
 
 def enrich_eval_metrics_from_s3(session: boto3.session.Session, graph: Dict[str, Any]) -> None:
     s3 = session.client("s3")
     candidates = ("report.json", "evaluation.json", "metrics.json")
     for n in graph.get("nodes", []):
+        # 필요시 조건 완화: n.get("type") == "Processing" and "Eval" in n["id"]
         if n.get("id") != "Evaluate":
             continue
         for o in n.get("outputs", []):
@@ -374,23 +407,30 @@ def enrich_eval_metrics_from_s3(session: boto3.session.Session, graph: Dict[str,
             b, k = _s3_split(o["uri"])
             if not b:
                 continue
+            # 1) key가 이미 *.json이면 직접 시도
             try_keys = []
             if k.endswith(".json"):
                 try_keys.append(k)
+            # 2) 폴더라면 후보 파일명들 붙여 시도
             for c in candidates:
                 try_keys.append(k.rstrip("/") + "/" + c)
+            # 시도
             for key in try_keys:
                 try:
                     obj = s3.get_object(Bucket=b, Key=key)
                     data = json.loads(obj["Body"].read())
+                    # {metrics:{...}} or 평평한 dict 모두 허용
                     base = data.get("metrics") if isinstance(data, dict) else None
                     src = base if isinstance(base, dict) else data
                     if isinstance(src, dict):
+                        # 숫자형만 추출
                         vals = {f"eval.{kk}": vv for kk, vv in src.items() if isinstance(vv, (int, float))}
                         if vals:
                             n.setdefault("run", {}).setdefault("metrics", {}).update(vals)
                             n.setdefault("run", {})["reportObject"] = f"s3://{b}/{key}"
-                            break
+                            raise StopIteration  # 이 노드는 성공했으니 다음 노드로
+                except StopIteration:
+                    break
                 except botocore.exceptions.ClientError:
                     continue
 
@@ -435,19 +475,32 @@ def enrich_artifact_s3_meta(artifacts: List[Dict[str,Any]], session: boto3.sessi
             pass
         a["s3"] = meta
 
-# ---------------------------
-# Public API for Lambda
-# ---------------------------
+# =======================================================
+# NEW: function entry for API/Lambda/FastAPI to call
+# =======================================================
 
-def get_lineage_json(region: str, pipeline_name: str, domain_name: Optional[str], include_latest_exec: bool) -> Dict[str, Any]:
-    # Lambda에서는 실행 역할을 사용 (프로필 없음)
+def get_lineage_json(
+    region: str,
+    pipeline_name: str,
+    domain_name: Optional[str] = None,
+    include_latest_exec: bool = False,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    기존 main()의 핵심 로직을 함수로 제공.
+    """
+    # 세션 설정
+    if profile:
+        boto3.setup_default_session(profile_name=profile, region_name=region)
     sm = boto3.client("sagemaker", region_name=region)
-    session = boto3.session.Session(region_name=region)
+    session = boto3.session.Session(profile_name=profile, region_name=region)
 
+    # (1) 도메인 조회(선택)
     domains = list_domains(sm)
     selected = pick_domain_by_name(domains, domain_name) if domain_name else None
     domain_id = selected.get("DomainId") if selected else None
 
+    # (2) 파이프라인 찾기 (+도메인 태그 필터)
     pipelines = list_all_pipelines(sm)
     target = None
     for p in pipelines:
@@ -458,25 +511,30 @@ def get_lineage_json(region: str, pipeline_name: str, domain_name: Optional[str]
     if not target:
         raise ValueError(f"Pipeline '{pipeline_name}' not found or not tagged for the given domain.")
 
+    # (3) 정의 → 그래프 구성
     pdef = get_pipeline_definition(sm, pipeline_name)
     graph = build_graph_from_definition(pdef)
 
+    # (3-1) 최신 실행 보강
     if include_latest_exec:
         enrich_with_latest_execution(sm, pipeline_name, graph)
 
+    # (3-2) 간선 중복/라벨 정리
     dedupe_and_label_edges(graph)
 
+    # (3-3) Evaluate 리포트 지표(선택)
     try:
         enrich_eval_metrics_from_s3(session, graph)
-    except Exception as e:
-        # 로깅만
-        print(f"[warn] eval metrics enrich skipped: {e}")
+    except Exception:
+        pass
 
+    # (3-4) S3 보안 메타(선택)
     enrich_artifact_s3_meta(graph["artifacts"], session)
 
+    # (3-5) 요약
     summary = pipeline_summary(graph)
 
-    result = {
+    return {
         "domain": (selected or {}),
         "pipeline": {
             "name": target["PipelineName"],
@@ -486,4 +544,36 @@ def get_lineage_json(region: str, pipeline_name: str, domain_name: Optional[str]
         "summary": summary,
         "graph": graph
     }
-    return result
+
+# ---------------------------
+# Main (CLI)
+# ---------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--region", required=True)
+    ap.add_argument("--pipeline-name", required=True)
+    ap.add_argument("--domain-name", help="파이프라인에 달아둔 Tag(DomainName)로 필터링")
+    ap.add_argument("--include-latest-exec", action="store_true", help="가장 최근 실행 정보를 반영해 입출력/지표 보강")
+    ap.add_argument("--profile", help="AWS 프로필명(선택)")
+    ap.add_argument("--out", help="JSON 파일로 저장 경로(선택)")
+    args = ap.parse_args()
+
+    data = get_lineage_json(
+        region=args.region,
+        pipeline_name=args.pipeline_name,
+        domain_name=args.domain_name,
+        include_latest_exec=args.include_latest_exec,
+        profile=args.profile,
+    )
+
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"[ok] saved: {args.out}")
+    else:
+        print(text)
+
+if __name__ == "__main__":
+    main()
