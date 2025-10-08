@@ -5,14 +5,12 @@ import uvicorn
 
 from lineage import (
     get_lineage_json,
-    build_inventory,          # NEW
-    get_available_regions,    # NEW
-    list_pipelines_with_domain,  # (선택) 필요 시 사용
+    build_inventory,          # 리전→도메인→파이프라인 카탈로그 생성
 )
 
-app = FastAPI(title="SageMaker Lineage API", version="1.1.0")
+app = FastAPI(title="SageMaker Lineage API", version="1.2.0")
 
-# CORS (운영에서는 특정 도메인으로 제한 권장)
+# CORS (운영에서는 특정 도메인만 허용 권장)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,11 +27,11 @@ def health():
     return {"status": "ok", "version": app.version}
 
 # -----------------------------
-# 1) Inventory: Region→Domain→Pipeline
+# 1) Catalog : Region→Domain→Pipeline /sagemaker/catalog 로만 제공
 # -----------------------------
-@app.get("/inventory")
-def inventory(
-    regions: str | None = Query(None, description="쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체"),
+@app.get("/sagemaker/catalog")
+def sagemaker_catalog(
+    regions: str | None = Query(None, description="쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도"),
     profile: str | None = Query(None, description="(개발용) 로컬 AWS 프로필명"),
 ):
     try:
@@ -41,10 +39,10 @@ def inventory(
         data = build_inventory(region_list, profile)
         return data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"inventory error: {e}")
+        raise HTTPException(status_code=500, detail=f"sagemaker catalog error: {e}")
 
 # -----------------------------
-# 2) Lineage: 기존 단건 조회
+# 2) Lineage: 단건 조회
 # -----------------------------
 @app.get("/lineage")
 def lineage_endpoint(
@@ -69,7 +67,7 @@ def lineage_endpoint(
         raise HTTPException(status_code=500, detail=f"internal error: {e}")
 
 # -----------------------------
-# 3) Lineage by Domain: 선택한 도메인에 매칭되는 모든 파이프라인 일괄
+# 3) Lineage by Domain: 해당 도메인에 매칭되는 모든 파이프라인 일괄
 # -----------------------------
 @app.get("/lineage/by-domain")
 def lineage_by_domain(
@@ -83,7 +81,7 @@ def lineage_by_domain(
     각각의 라인리지를 수행해 한번에 반환
     """
     try:
-        # 인벤토리에서 해당 도메인과 매칭된 파이프라인만 추출
+        # /sagemaker/catalog 과 동일한 로직으로, 지정 리전만 카탈로그 생성
         inv = build_inventory([region], profile)
         region_block = next((r for r in inv["regions"] if r["region"] == region), None)
         if not region_block:
