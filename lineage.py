@@ -475,8 +475,92 @@ def enrich_artifact_s3_meta(artifacts: List[Dict[str,Any]], session: boto3.sessi
             pass
         a["s3"] = meta
 
+
 # =======================================================
-# NEW: function entry for API/Lambda/FastAPI to call
+# Inventory helpers (regions/domains/pipelines)
+# =======================================================
+
+def get_available_regions() -> List[str]:
+    """
+    boto3가 아는 SageMaker 서비스 사용 가능 리전 목록을 반환
+    """
+    return boto3.session.Session().get_available_regions("sagemaker")
+
+def list_domains_in_region(region: str, profile: Optional[str] = None) -> List[Dict[str, Any]]:
+    if profile:
+        boto3.setup_default_session(profile_name=profile, region_name=region)
+    sm = boto3.client("sagemaker", region_name=region)
+    return list_domains(sm)
+
+def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    리전 내 파이프라인 + 태그를 함께 반환
+    matchedDomain: 파이프라인 태그에 DomainId/DomainName가 있으면 채워짐
+    """
+    if profile:
+        boto3.setup_default_session(profile_name=profile, region_name=region)
+    sm = boto3.client("sagemaker", region_name=region)
+
+    # 파이프라인 목록
+    pipes = list_all_pipelines(sm)
+
+    # 도메인 사전 (id/name로 빠르게 매칭)
+    doms = { d["DomainId"]: d for d in list_domains(sm) }
+    doms_by_name = { d["DomainName"]: d for d in doms.values() }
+
+    out = []
+    for p in pipes:
+        arn = p["PipelineArn"]
+        try:
+            tags = sm.list_tags(ResourceArn=arn).get("Tags", [])
+        except Exception:
+            tags = []
+        kv = {t["Key"]: t["Value"] for t in tags}
+        dom = None
+        if "DomainId" in kv and kv["DomainId"] in doms:
+            dom = doms[kv["DomainId"]]
+        elif "DomainName" in kv and kv["DomainName"] in doms_by_name:
+            dom = doms_by_name[kv["DomainName"]]
+        out.append({
+            "name": p["PipelineName"],
+            "arn": arn,
+            "lastModifiedTime": _iso(p.get("LastModifiedTime","")),
+            "tags": kv,
+            "matchedDomain": ({"DomainId": dom["DomainId"], "DomainName": dom["DomainName"]} if dom else None)
+        })
+    return out
+
+def build_inventory(regions: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    { regions: [ {region, domains:[...], pipelines:[...]} ] }
+    형태로 Region→Domain→Pipeline 인벤토리를 구성
+    """
+    if not regions:
+        regions = get_available_regions()
+    regions = sorted(set(regions))
+
+    inventory = []
+    for r in regions:
+        try:
+            doms = list_domains_in_region(r, profile)
+            doms_slim = [{"DomainId": d["DomainId"], "DomainName": d.get("DomainName","")} for d in doms]
+            pipes = list_pipelines_with_domain(r, profile)
+            inventory.append({
+                "region": r,
+                "domains": doms_slim,
+                "pipelines": pipes
+            })
+        except Exception as e:
+            inventory.append({
+                "region": r,
+                "error": str(e),
+                "domains": [],
+                "pipelines": []
+            })
+    return {"regions": inventory}
+
+# =======================================================
+# Function entry for API/Lambda/FastAPI to call
 # =======================================================
 
 def get_lineage_json(
