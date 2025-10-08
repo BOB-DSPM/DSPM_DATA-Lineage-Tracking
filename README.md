@@ -3,6 +3,8 @@
 **SageMaker 파이프라인의 데이터 라인리지(노드/엣지/아티팩트)와 실행 상태**를 JSON으로 제공하는 API로,  
 핵심 로직은 `lineage.py`의 `get_lineage_json()`이며, HTTP 레이어는 `api.py`가 담당한다.
 
+> v1.3.0 기준 문서 — 신규 엔드포인트 **`/sagemaker/overview`** 추가(리전별 Domain + Pipeline 일괄 조회).
+
 ---
 
 ## ✨ 제공 기능
@@ -31,23 +33,14 @@
 
 ## 🔌 전체 동작 흐름
 
-<<<<<<< HEAD
 1. 페이지 초기 로딩 시 `GET /sagemaker/overview?includeLatestExec=true` 호출 → **리전별 Domain + Pipeline**을 한 번에 수신
 2. 프론트에서 지역/도메인/파이프라인을 **필터링만** 수행(재호출 없음)
 3. 사용자가 특정 파이프라인을 선택하면 `GET /lineage` 호출로 상세 그래프/요약 조회
 4. 필요 시 도메인 단위로 `GET /lineage/by-domain` 호출(해당 도메인의 모든 파이프라인 일괄)
 
 > 기존 방식(`/sagemaker/catalog`)도 유지되며, 특정 리전만 빠르게 보고 싶을 때 유용함.
-=======
-1. 클라이언트가 `GET /sagemaker/catalog` 호출 → **리전별 도메인 목록** 및 **해당 도메인 태그가 매칭된 파이프라인 목록** 수신
-2. 사용자에게 **리전 → 도메인**을 선택하게 함
-3. 선택된 도메인에 대해
-   - 여러 파이프라인을 한 번에 보고 싶으면 `GET /lineage/by-domain`
-   - 특정 파이프라인만 보고 싶으면 `GET /lineage` 호출
-4. 반환 JSON의 `graph.nodes / graph.edges / graph.artifacts` 및 `summary`를 시각화/표시
->>>>>>> be2cd12e3025984e4adc68b6f2d61d95af53ec68
 
-반환 스키마(요약):
+반환 스키마(요약, `/lineage`):
 ```jsonc
 {
   "domain": {...},          // 선택: DomainName 태그 필터 사용 시
@@ -77,7 +70,7 @@
 ```bash
 python -m venv .venv
 # Windows
-.\.venv\Scripts\activate
+.\.venv\Scriptsctivate
 # macOS / Linux
 source .venv/bin/activate
 ```
@@ -86,6 +79,7 @@ source .venv/bin/activate
 ```bash
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+# requirements가 없다면: fastapi uvicorn boto3 botocore 설치
 ```
 
 ### 3) 서버 실행
@@ -102,12 +96,9 @@ python api.py
 # 헬스체크
 curl "http://localhost:8000/health"
 
-<<<<<<< HEAD
 # (예) 리전 개요: 다수 리전 스캔 + 최신 실행 포함
 curl "http://localhost:8000/sagemaker/overview?includeLatestExec=true&regions=ap-northeast-2"
 
-=======
->>>>>>> be2cd12e3025984e4adc68b6f2d61d95af53ec68
 # (예) 카탈로그: 특정 리전만
 curl "http://localhost:8000/sagemaker/catalog?regions=ap-northeast-2"
 
@@ -118,7 +109,7 @@ curl "http://localhost:8000/lineage/by-domain?region=ap-northeast-2&domain=<DOMA
 curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAME>&domain=<DOMAIN_NAME>&includeLatestExec=true"
 ```
 
-> 개발 중 로컬 AWS 프로필을 사용하려면 쿼리스트링에 `&profile=default` 추가 또는 환경변수 `AWS_PROFILE=default`로 지정.  
+> 개발 중 로컬 AWS 프로필을 사용하려면 쿼리스트링에 `&profile=dev` 추가 또는 환경변수 `AWS_PROFILE=dev`로 지정.  
 > 운영 배포에서는 프로필 파라미터 제거 + **IAM Role** 사용 권장.
 
 ---
@@ -131,7 +122,6 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 { "status": "ok", "version": "1.3.0" }
 ```
 
-<<<<<<< HEAD
 ### `GET /sagemaker/overview`
 - 설명: 여러 리전을 한 번에 스캔하여 `region → {domains[], pipelines[]}` 구조 반환
 - 쿼리:
@@ -165,34 +155,11 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 }
 ```
 
-=======
->>>>>>> be2cd12e3025984e4adc68b6f2d61d95af53ec68
 ### `GET /sagemaker/catalog`
-리전별 도메인/파이프라인 카탈로그.
+리전별 도메인/파이프라인 카탈로그(기존).
 - 쿼리:  
   - `regions` (선택) — 쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도  
   - `profile` (선택, 개발용) — 로컬 AWS 프로필명
-
-응답 예시:
-```json
-{
-  "regions": [
-    {
-      "region": "ap-northeast-2",
-      "domains": [{ "DomainId": "d-xxxxxx", "DomainName": "studio-a" }],
-      "pipelines": [
-        {
-          "name": "mlops-pipe",
-          "arn": "arn:aws:sagemaker:...:pipeline/mlops-pipe",
-          "lastModifiedTime": "2025-10-08T12:34:56+00:00",
-          "tags": { "DomainName": "studio-a" },
-          "matchedDomain": { "DomainId": "d-xxxxxx", "DomainName": "studio-a" }
-        }
-      ]
-    }
-  ]
-}
-```
 
 ### `GET /lineage`
 단일 파이프라인 라인리지 조회.
@@ -210,8 +177,7 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
   - `domain` (필수) — DomainName  
   - `includeLatestExec` (선택) — 최신 실행 포함 여부  
   - `profile` (선택, 개발용) — 로컬 프로필명
-
-응답:
+- 응답:
 ```jsonc
 {
   "region": "ap-northeast-2",
@@ -270,6 +236,14 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 
 ---
 
+## ⚙️ 환경변수 (운영 팁)
+
+- `ALLOWED_REGIONS="ap-northeast-2,us-east-1"` — 스캔/허용 리전 제한
+- `OVERVIEW_TTL_SECONDS="60"` — `/sagemaker/overview` 결과 캐시 TTL(초). `0`이면 비활성
+- (컨테이너 사용 시) `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION` 또는 `-v ~/.aws:/root/.aws:ro` + `AWS_PROFILE`
+
+---
+
 ## 🧑‍💻 프론트엔드 연동 예시
 
 ```js
@@ -316,5 +290,5 @@ docker run --rm -p 8000:8000 lineage-api
 ## ⚠️ 주의 & 팁
 
 - 대규모 계정/리전에서 전 리전 스캔은 느릴 수 있으므로 운영에서는 `ALLOWED_REGIONS`로 제한하고, `/sagemaker/overview` 캐시(`OVERVIEW_TTL_SECONDS`)를 권장함.
-- Evaluate 리포트 탐색 규칙은 `Evaluate` 스텝의 `report` 출력 경로에서 파일명을 **우선 탐색**하므로, 명명 규칙이 다르면 코드에서 조건을 맞춰야 함.
+- Evaluate 리포트 탐색 규칙은 `Evaluate` 스텝의 `report` 출력 경로에서 파일명을 **우선 탐색**하고, 명명 규칙이 다르면 코드에서 조건을 맞춰야 함.
 - 프로덕션에서는 CORS 제한, 최소 권한, 모니터링/로깅, 헬스체크(현재 `/health`) 설정을 권장함.
