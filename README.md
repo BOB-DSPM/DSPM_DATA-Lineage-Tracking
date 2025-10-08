@@ -31,12 +31,21 @@
 
 ## 🔌 전체 동작 흐름
 
+<<<<<<< HEAD
 1. 페이지 초기 로딩 시 `GET /sagemaker/overview?includeLatestExec=true` 호출 → **리전별 Domain + Pipeline**을 한 번에 수신
 2. 프론트에서 지역/도메인/파이프라인을 **필터링만** 수행(재호출 없음)
 3. 사용자가 특정 파이프라인을 선택하면 `GET /lineage` 호출로 상세 그래프/요약 조회
 4. 필요 시 도메인 단위로 `GET /lineage/by-domain` 호출(해당 도메인의 모든 파이프라인 일괄)
 
 > 기존 방식(`/sagemaker/catalog`)도 유지되며, 특정 리전만 빠르게 보고 싶을 때 유용함.
+=======
+1. 클라이언트가 `GET /sagemaker/catalog` 호출 → **리전별 도메인 목록** 및 **해당 도메인 태그가 매칭된 파이프라인 목록** 수신
+2. 사용자에게 **리전 → 도메인**을 선택하게 함
+3. 선택된 도메인에 대해
+   - 여러 파이프라인을 한 번에 보고 싶으면 `GET /lineage/by-domain`
+   - 특정 파이프라인만 보고 싶으면 `GET /lineage` 호출
+4. 반환 JSON의 `graph.nodes / graph.edges / graph.artifacts` 및 `summary`를 시각화/표시
+>>>>>>> be2cd12e3025984e4adc68b6f2d61d95af53ec68
 
 반환 스키마(요약):
 ```jsonc
@@ -93,9 +102,12 @@ python api.py
 # 헬스체크
 curl "http://localhost:8000/health"
 
+<<<<<<< HEAD
 # (예) 리전 개요: 다수 리전 스캔 + 최신 실행 포함
 curl "http://localhost:8000/sagemaker/overview?includeLatestExec=true&regions=ap-northeast-2"
 
+=======
+>>>>>>> be2cd12e3025984e4adc68b6f2d61d95af53ec68
 # (예) 카탈로그: 특정 리전만
 curl "http://localhost:8000/sagemaker/catalog?regions=ap-northeast-2"
 
@@ -119,6 +131,7 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 { "status": "ok", "version": "1.3.0" }
 ```
 
+<<<<<<< HEAD
 ### `GET /sagemaker/overview`
 - 설명: 여러 리전을 한 번에 스캔하여 `region → {domains[], pipelines[]}` 구조 반환
 - 쿼리:
@@ -152,6 +165,8 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 }
 ```
 
+=======
+>>>>>>> be2cd12e3025984e4adc68b6f2d61d95af53ec68
 ### `GET /sagemaker/catalog`
 리전별 도메인/파이프라인 카탈로그.
 - 쿼리:  
