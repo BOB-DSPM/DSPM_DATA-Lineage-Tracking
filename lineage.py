@@ -480,11 +480,19 @@ def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> Li
         boto3.setup_default_session(profile_name=profile, region_name=region)
     sm = boto3.client("sagemaker", region_name=region)
 
+    def _domain_id_from_arn(arn: str) -> Optional[str]:
+        # arn:aws:sagemaker:ap-northeast-2:acct:domain/d-xxxxxxxxxxxx
+        try:
+            part = arn.split(":")[5]          # 'domain/d-xxxx'
+            return part.split("/", 1)[1]      # 'd-xxxx'
+        except Exception:
+            return None
+
     pipes = list_all_pipelines(sm)
 
-    # 도메인 사전 (id/name로 빠르게 매칭)
-    doms = {d["DomainId"]: d for d in list_domains(sm)}
-    doms_by_name = {d["DomainName"]: d for d in doms.values() if d.get("DomainName")}
+    # 미리 도메인 캐시
+    doms = { d["DomainId"]: d for d in list_domains(sm) }
+    doms_by_name = { d.get("DomainName"): d for d in doms.values() if d.get("DomainName") }
 
     out: List[Dict[str, Any]] = []
     for p in pipes:
@@ -493,21 +501,30 @@ def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> Li
             tag_list = sm.list_tags(ResourceArn=arn).get("Tags", [])
         except Exception:
             tag_list = []
+        kv = {t["Key"]: t["Value"] for t in tag_list}  # 원본 태그
 
-        kv = {t["Key"]: t["Value"] for t in tag_list}
         dom = None
-        if kv:
-            if "DomainId" in kv and kv["DomainId"] in doms:
-                dom = doms[kv["DomainId"]]
-            elif "DomainName" in kv and kv["DomainName"] in doms_by_name:
-                dom = doms_by_name[kv["DomainName"]]
+        # 1) 명시적 태그 우선
+        if "DomainId" in kv and kv["DomainId"] in doms:
+            dom = doms[kv["DomainId"]]
+        elif "DomainName" in kv and kv["DomainName"] in doms_by_name:
+            dom = doms_by_name[kv["DomainName"]]
+        else:
+            # 2) 스튜디오 자동태그로 추론 (sagemaker:domain-arn)
+            d_arn = kv.get("sagemaker:domain-arn")
+            d_id = _domain_id_from_arn(d_arn) if d_arn else None
+            if d_id and d_id in doms:
+                dom = doms[d_id]
 
         out.append({
             "name": p["PipelineName"],
             "arn": arn,
-            "lastModifiedTime": _iso(p.get("LastModifiedTime", "")),
-            "tags": (kv or None),  # ← 비어 있으면 None → JSON null
-            "matchedDomain": ({"DomainId": dom["DomainId"], "DomainName": dom["DomainName"]} if dom else None)
+            "lastModifiedTime": _iso(p.get("LastModifiedTime","")),
+            "tags": (kv or None),  # 비어있으면 null
+            "matchedDomain": (
+                {"DomainId": dom["DomainId"], "DomainName": dom.get("DomainName")}
+                if dom else None
+            ),
         })
     return out
 

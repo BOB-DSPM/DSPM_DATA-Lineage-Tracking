@@ -111,11 +111,10 @@ def sagemaker_pipelines(
                     s = name.lower()
                     pipes = [p for p in pipes if s in p["name"].lower()]
                 if domainName:
-                    pipes = [
-                        p for p in pipes
-                        if (p.get("matchedDomain") and p["matchedDomain"].get("DomainName") == domainName)
-                        or ((p.get("tags") or {}).get("DomainName") == domainName)
-                    ]
+                    dn = domainName.lower()
+                    pipes = [p for p in pipes
+                            if (p.get("matchedDomain") and p["matchedDomain"].get("DomainName","").lower() == dn)
+                            or ((p.get("tags") or {}).get("DomainName","").lower() == dn)]
                 if domainId:
                     pipes = [
                         p for p in pipes
