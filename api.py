@@ -1,8 +1,5 @@
-# api.py
 from __future__ import annotations
 
-import os
-import time
 from typing import Optional, List, Dict, Any
 
 import boto3
@@ -12,8 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from lineage import (
-    get_lineage_json,
-    build_inventory,          # 리전→도메인→파이프라인 카탈로그 생성
+    get_lineage_json,           # 단건 라인리지 그래프 생성
+    list_pipelines_with_domain, # 파이프라인 목록 + 태그/도메인 매핑
 )
 
 # -----------------------------------------------------------------------------
@@ -31,71 +28,32 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# 공통 설정
+# boto3 공통 설정
 # -----------------------------------------------------------------------------
 _BOTO_CFG = Config(
     retries={"max_attempts": 5, "mode": "adaptive"},
     connect_timeout=5,
-    read_timeout=60
+    read_timeout=60,
 )
-
-# 운영에서 리전 스캔 범위를 제한하고 싶으면 환경변수로 지정
-# 예) ALLOWED_REGIONS="ap-northeast-2,us-east-1"
-_ALLOWED_REGIONS_ENV = os.getenv("ALLOWED_REGIONS")
-_ALLOWED_REGIONS = (
-    {r.strip() for r in _ALLOWED_REGIONS_ENV.split(",")} if _ALLOWED_REGIONS_ENV else None
-)
-
-# 간단 메모리 캐시(선택): overview 결과 캐싱 TTL(초) — 트래픽 많은 환경에서 UX 개선
-_OVERVIEW_CACHE: Dict[str, Any] = {"ts": 0, "key": "", "data": None}
-_OVERVIEW_TTL_SECONDS = int(os.getenv("OVERVIEW_TTL_SECONDS", "0"))  # 0이면 캐싱 비활성화
-
 
 # -----------------------------------------------------------------------------
-# Utils for /sagemaker/overview
+# Utils
 # -----------------------------------------------------------------------------
 def _parse_regions(regions: Optional[str], profile: Optional[str]) -> List[str]:
     """
     regions 쿼리가 있으면 그것을 사용,
     없으면 boto3 Session에서 sagemaker 지원 모든 리전을 반환
-    (운영에서는 ALLOWED_REGIONS 교집합으로 제한 가능)
     """
     if regions:
         parsed = [r.strip() for r in regions.split(",") if r.strip()]
     else:
         sess = boto3.session.Session(profile_name=profile) if profile else boto3.session.Session()
         parsed = sess.get_available_regions("sagemaker")
-
-    if _ALLOWED_REGIONS:
-        parsed = [r for r in parsed if r in _ALLOWED_REGIONS]
-
     return parsed
 
 
-def _list_all_domains(sm) -> List[Dict[str, Any]]:
-    """
-    SageMaker ListDomains (Paginator)
-    """
-    paginator = sm.get_paginator("list_domains")
-    items: List[Dict[str, Any]] = []
-    for page in paginator.paginate():
-        for d in page.get("Domains", []):
-            items.append({
-                "domainId": d.get("DomainId"),
-                "domainArn": d.get("DomainArn"),
-                "domainName": d.get("DomainName"),
-                "status": d.get("Status"),
-                "url": d.get("Url"),
-                "homeEfsFileSystemId": d.get("HomeEfsFileSystemId"),
-                "creationTime": d.get("CreationTime").isoformat() if d.get("CreationTime") else None
-            })
-    return items
-
-
 def _get_latest_pipeline_execution(sm, pipeline_name: str) -> Dict[str, Any]:
-    """
-    최신 파이프라인 실행 1건 요약
-    """
+    """최신 파이프라인 실행 1건 요약"""
     resp = sm.list_pipeline_executions(
         PipelineName=pipeline_name,
         SortBy="CreationTime",
@@ -113,32 +71,6 @@ def _get_latest_pipeline_execution(sm, pipeline_name: str) -> Dict[str, Any]:
         "lastModifiedTime": x.get("LastUpdatedTime").isoformat() if x.get("LastUpdatedTime") else None
     }
 
-
-def _list_all_pipelines(sm, include_latest: bool) -> List[Dict[str, Any]]:
-    """
-    SageMaker ListPipelines (Paginator)
-    include_latest=True면 최신 실행 1건 붙임
-    """
-    paginator = sm.get_paginator("list_pipelines")
-    items: List[Dict[str, Any]] = []
-    for page in paginator.paginate(SortBy="CreationTime", SortOrder="Descending"):
-        for p in page.get("PipelineSummaries", []):
-            row = {
-                "pipelineName": p.get("PipelineName"),
-                "pipelineArn": p.get("PipelineArn"),
-                "created": p.get("CreationTime").isoformat() if p.get("CreationTime") else None,
-                "lastModifiedTime": p.get("LastModifiedTime").isoformat() if p.get("LastModifiedTime") else None
-            }
-            if include_latest and p.get("PipelineName"):
-                try:
-                    row["latestExecution"] = _get_latest_pipeline_execution(sm, p["PipelineName"])
-                except Exception:
-                    # 최신 실행 조회 실패는 치명적이지 않으므로 무시하고 진행
-                    row["latestExecution"] = {}
-            items.append(row)
-    return items
-
-
 # -----------------------------------------------------------------------------
 # 0) Health Check
 # -----------------------------------------------------------------------------
@@ -148,77 +80,72 @@ def health():
 
 
 # -----------------------------------------------------------------------------
-# 1) Catalog : Region→Domain→Pipeline (/sagemaker/catalog)
+# 1) pipelines: 파이프라인 목록 + 태그/도메인 매핑
 # -----------------------------------------------------------------------------
-@app.get("/sagemaker/catalog")
-def sagemaker_catalog(
-    regions: str | None = Query(None, description="쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도"),
-    profile: str | None = Query(None, description="(개발용) 로컬 AWS 프로필명"),
-):
-    try:
-        region_list = [r.strip() for r in regions.split(",")] if regions else None
-        # ALLOWED_REGIONS가 설정되어 있으면 build_inventory 전에 필터링
-        if region_list and _ALLOWED_REGIONS:
-            region_list = [r for r in region_list if r in _ALLOWED_REGIONS]
-        data = build_inventory(region_list, profile)
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"sagemaker catalog error: {e}")
-
-
-# -----------------------------------------------------------------------------
-# 1-2) Region Overview (Domains + Pipelines)
-#      프론트 초기 로딩 시 한 번 호출해서
-#      region → {domains[], pipelines[]} 구조를 한 번에 구성
-# -----------------------------------------------------------------------------
-@app.get("/sagemaker/overview")
-def sagemaker_overview(
-    regions: Optional[str] = Query(None, description="쉼표구분 리전 목록. 없으면 SageMaker 지원 리전 전체 스캔"),
+@app.get("/sagemaker/pipelines")
+def sagemaker_pipelines(
+    regions: Optional[str] = Query(None, description="쉼표구분 리전 목록. 없으면 SageMaker 지원 리전 전체"),
     includeLatestExec: bool = Query(False, description="파이프라인별 최신 실행 요약 포함"),
-    profile: Optional[str] = Query(None, description="(개발용) 로컬 AWS 프로필명. 운영에서는 미사용/무시 권장"),
+    profile: Optional[str] = Query(None, description="(개발/로컬) AWS 프로필명"),
+    name: Optional[str] = Query(None, description="파이프라인 이름 부분일치 필터(선택)"),
+    domainName: Optional[str] = Query(None, description="태그 DomainName=... 으로 필터(선택)"),
+    domainId: Optional[str] = Query(None, description="태그 DomainId=... 으로 필터(선택)"),
 ):
+    """
+    리전별 '파이프라인 목록만' 반환. 각 파이프라인에는 태그 기반으로
+    matchedDomain: {DomainId, DomainName} 가 매핑되어 함께 포함된다.
+    - name, domainName, domainId 로 필터링 가능
+    - includeLatestExec=true 이면 latestExecution 요약도 덧붙임
+    """
     try:
-        # 간단 캐시 키: regions|includeLatestExec|profile + ALLOWED_REGIONS 버전
-        cache_key = f"regions={regions}|latest={includeLatestExec}|profile={bool(profile)}|allowed={','.join(sorted(_ALLOWED_REGIONS)) if _ALLOWED_REGIONS else ''}"
-        now = int(time.time())
-        if _OVERVIEW_TTL_SECONDS > 0:
-            if _OVERVIEW_CACHE["data"] is not None and _OVERVIEW_CACHE["key"] == cache_key:
-                if now - _OVERVIEW_CACHE["ts"] <= _OVERVIEW_TTL_SECONDS:
-                    return _OVERVIEW_CACHE["data"]
-
         region_list = _parse_regions(regions, profile)
         out: List[Dict[str, Any]] = []
 
         for r in region_list:
-            sess = boto3.session.Session(profile_name=profile, region_name=r) if profile \
-                else boto3.session.Session(region_name=r)
-            sm = sess.client("sagemaker", config=_BOTO_CFG)
-
-            # 각 리전에서 도메인/파이프라인 조회
             try:
-                domains = _list_all_domains(sm)
+                # 태그 + matchedDomain 포함하여 가져오기
+                pipes = list_pipelines_with_domain(region=r, profile=profile)
+
+                # 이름/도메인 필터
+                if name:
+                    s = name.lower()
+                    pipes = [p for p in pipes if s in p["name"].lower()]
+                if domainName:
+                    pipes = [
+                        p for p in pipes
+                        if (p.get("matchedDomain") and p["matchedDomain"].get("DomainName") == domainName)
+                        or ((p.get("tags") or {}).get("DomainName") == domainName)
+                    ]
+                if domainId:
+                    pipes = [
+                        p for p in pipes
+                        if (p.get("matchedDomain") and p["matchedDomain"].get("DomainId") == domainId)
+                        or ((p.get("tags") or {}).get("DomainId") == domainId)
+                    ]
+
+                # 최신 실행 1건 요약 추가
+                if includeLatestExec:
+                    sess = boto3.session.Session(profile_name=profile, region_name=r) if profile \
+                        else boto3.session.Session(region_name=r)
+                    sm = sess.client("sagemaker", config=_BOTO_CFG)
+                    for p in pipes:
+                        try:
+                            p["latestExecution"] = _get_latest_pipeline_execution(sm, p["name"])
+                        except Exception:
+                            p["latestExecution"] = {}
+
+                out.append({"region": r, "pipelines": pipes})
             except Exception as e:
-                domains = []
-            try:
-                pipelines = _list_all_pipelines(sm, include_latest=includeLatestExec)
-            except Exception as e:
-                pipelines = []
+                out.append({"region": r, "error": str(e), "pipelines": []})
 
-            out.append({"region": r, "domains": domains, "pipelines": pipelines})
-
-        data = {"regions": out}
-
-        if _OVERVIEW_TTL_SECONDS > 0:
-            _OVERVIEW_CACHE.update({"ts": now, "key": cache_key, "data": data})
-
-        return data
+        return {"regions": out}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"sagemaker overview error: {e}")
+        raise HTTPException(status_code=500, detail=f"sagemaker pipelines error: {e}")
 
 
 # -----------------------------------------------------------------------------
-# 2) Lineage: 단건 조회
+# 2) 단건 라인리지 그래프
 # -----------------------------------------------------------------------------
 @app.get("/lineage")
 def lineage_endpoint(
@@ -244,7 +171,7 @@ def lineage_endpoint(
 
 
 # -----------------------------------------------------------------------------
-# 3) Lineage by Domain: 해당 도메인에 매칭되는 모든 파이프라인 일괄
+# 3) 도메인에 매칭되는 모든 파이프라인 라인리지
 # -----------------------------------------------------------------------------
 @app.get("/lineage/by-domain")
 def lineage_by_domain(
@@ -256,29 +183,24 @@ def lineage_by_domain(
     """
     해당 리전에서 DomainName 태그가 일치하는 파이프라인들을 전부 찾아
     각각의 라인리지를 수행해 한번에 반환
+    (build_inventory 의존 제거 버전)
     """
     try:
-        # /sagemaker/catalog 과 동일한 로직으로, 지정 리전만 카탈로그 생성
-        inv = build_inventory([region], profile)
-        region_block = next((r for r in inv["regions"] if r["region"] == region), None)
-        if not region_block:
-            raise HTTPException(status_code=404, detail=f"region not found: {region}")
+        # 1) 해당 리전의 파이프라인 + 태그 조회
+        pipes = list_pipelines_with_domain(region=region, profile=profile)
 
-        target_pipes: List[str] = []
-        for p in region_block.get("pipelines", []):
-            md = p.get("matchedDomain")
-            # (1) 파이프라인 태그에 DomainName이 맞는지
-            if md and md.get("DomainName") == domain:
-                target_pipes.append(p["name"])
-            # (2) 혹은 tags에 DomainName 직접 기입된 경우
-            elif p.get("tags", {}).get("DomainName") == domain:
-                target_pipes.append(p["name"])
-
-        if not target_pipes:
+        # 2) DomainName=... 태그가 있는 파이프라인만 남기기
+        targets = [
+            p["name"] for p in pipes
+            if (p.get("matchedDomain") and p["matchedDomain"].get("DomainName") == domain)
+            or ((p.get("tags") or {}).get("DomainName") == domain)
+        ]
+        if not targets:
             raise HTTPException(status_code=404, detail=f"no pipelines tagged with DomainName={domain} in {region}")
 
-        results: List[Dict[str, Any]] = []
-        for name in target_pipes:
+        # 3) 각 파이프라인의 라인리지 생성
+        results = []
+        for name in targets:
             try:
                 data = get_lineage_json(
                     region=region,
@@ -291,13 +213,7 @@ def lineage_by_domain(
             except Exception as e:
                 results.append({"pipeline": name, "ok": False, "error": str(e)})
 
-        return {
-            "region": region,
-            "domain": domain,
-            "count": len(results),
-            "results": results
-        }
-
+        return {"region": region, "domain": domain, "count": len(results), "results": results}
     except HTTPException:
         raise
     except Exception as e:

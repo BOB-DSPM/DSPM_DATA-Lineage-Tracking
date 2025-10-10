@@ -1,4 +1,3 @@
-# lineage.py
 import argparse, json, sys, re, datetime as dt
 from typing import Dict, List, Any, Tuple, Optional
 import boto3
@@ -12,9 +11,7 @@ _REF_RE = re.compile(r"Steps\.([A-Za-z0-9\-_]+)")
 _S3_RE  = re.compile(r"^s3://([^/]+)/?(.*)$")
 
 def _extract_ref_step(ref: dict | str) -> str | None:
-    """
-    {"Get":"Steps.Preprocess...."} -> "Preprocess" 같은 source step 이름 추출
-    """
+    """{"Get":"Steps.Preprocess...."} -> "Preprocess" 같은 source step 이름 추출"""
     if isinstance(ref, dict):
         ref = ref.get("Get") or ref.get("Std:Ref") or ""
     if not isinstance(ref, str):
@@ -29,7 +26,7 @@ def _s3_split(uri: str) -> Tuple[Optional[str], Optional[str]]:
     return m.group(1), m.group(2)  # bucket, key
 
 def _iso(s) -> str:
-    return s.isoformat() if hasattr(s, "isoformat") else str(s)
+    return s.isoformat() if hasattr(s, "isoformat") else (str(s) if s is not None else None)
 
 # ---------------------------
 # SageMaker list / pick
@@ -335,7 +332,7 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
         print(f"[warn] enrich failed: {e}", file=sys.stderr)
 
 # ---------------------------
-# (1) Edges de-dup & label cleanup (remove 'code', 'input-*')
+# (1) Edges de-dup & label cleanup
 # ---------------------------
 
 def dedupe_and_label_edges(graph: Dict[str, Any]) -> None:
@@ -364,7 +361,7 @@ def dedupe_and_label_edges(graph: Dict[str, Any]) -> None:
     graph["edges"] = new_edges
 
 # ---------------------------
-# (2) Pipeline summary (overall status / totals)
+# (2) Pipeline summary
 # ---------------------------
 
 def pipeline_summary(graph: Dict[str, Any]) -> Dict[str, Any]:
@@ -398,7 +395,6 @@ def enrich_eval_metrics_from_s3(session: boto3.session.Session, graph: Dict[str,
     s3 = session.client("s3")
     candidates = ("report.json", "evaluation.json", "metrics.json")
     for n in graph.get("nodes", []):
-        # 필요시 조건 완화: n.get("type") == "Processing" and "Eval" in n["id"]
         if n.get("id") != "Evaluate":
             continue
         for o in n.get("outputs", []):
@@ -407,28 +403,23 @@ def enrich_eval_metrics_from_s3(session: boto3.session.Session, graph: Dict[str,
             b, k = _s3_split(o["uri"])
             if not b:
                 continue
-            # 1) key가 이미 *.json이면 직접 시도
             try_keys = []
             if k.endswith(".json"):
                 try_keys.append(k)
-            # 2) 폴더라면 후보 파일명들 붙여 시도
             for c in candidates:
                 try_keys.append(k.rstrip("/") + "/" + c)
-            # 시도
             for key in try_keys:
                 try:
                     obj = s3.get_object(Bucket=b, Key=key)
                     data = json.loads(obj["Body"].read())
-                    # {metrics:{...}} or 평평한 dict 모두 허용
                     base = data.get("metrics") if isinstance(data, dict) else None
                     src = base if isinstance(base, dict) else data
                     if isinstance(src, dict):
-                        # 숫자형만 추출
                         vals = {f"eval.{kk}": vv for kk, vv in src.items() if isinstance(vv, (int, float))}
                         if vals:
                             n.setdefault("run", {}).setdefault("metrics", {}).update(vals)
                             n.setdefault("run", {})["reportObject"] = f"s3://{b}/{key}"
-                            raise StopIteration  # 이 노드는 성공했으니 다음 노드로
+                            raise StopIteration
                 except StopIteration:
                     break
                 except botocore.exceptions.ClientError:
@@ -475,92 +466,53 @@ def enrich_artifact_s3_meta(artifacts: List[Dict[str,Any]], session: boto3.sessi
             pass
         a["s3"] = meta
 
-
-# =======================================================
-# Inventory helpers (regions/domains/pipelines)
-# =======================================================
-
-def get_available_regions() -> List[str]:
-    """
-    boto3가 아는 SageMaker 서비스 사용 가능 리전 목록을 반환
-    """
-    return boto3.session.Session().get_available_regions("sagemaker")
-
-def list_domains_in_region(region: str, profile: Optional[str] = None) -> List[Dict[str, Any]]:
-    if profile:
-        boto3.setup_default_session(profile_name=profile, region_name=region)
-    sm = boto3.client("sagemaker", region_name=region)
-    return list_domains(sm)
+# ---------------------------
+# pipelines with domain (for /sagemaker/pipelines, /lineage/by-domain)
+# ---------------------------
 
 def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     리전 내 파이프라인 + 태그를 함께 반환
-    matchedDomain: 파이프라인 태그에 DomainId/DomainName가 있으면 채워짐
+    - matchedDomain: 파이프라인 태그에 DomainId/DomainName가 있으면 채워짐
+    - tags: 비어 있으면 None(JSON에서는 null)
     """
     if profile:
         boto3.setup_default_session(profile_name=profile, region_name=region)
     sm = boto3.client("sagemaker", region_name=region)
 
-    # 파이프라인 목록
     pipes = list_all_pipelines(sm)
 
     # 도메인 사전 (id/name로 빠르게 매칭)
-    doms = { d["DomainId"]: d for d in list_domains(sm) }
-    doms_by_name = { d["DomainName"]: d for d in doms.values() }
+    doms = {d["DomainId"]: d for d in list_domains(sm)}
+    doms_by_name = {d["DomainName"]: d for d in doms.values() if d.get("DomainName")}
 
-    out = []
+    out: List[Dict[str, Any]] = []
     for p in pipes:
         arn = p["PipelineArn"]
         try:
-            tags = sm.list_tags(ResourceArn=arn).get("Tags", [])
+            tag_list = sm.list_tags(ResourceArn=arn).get("Tags", [])
         except Exception:
-            tags = []
-        kv = {t["Key"]: t["Value"] for t in tags}
+            tag_list = []
+
+        kv = {t["Key"]: t["Value"] for t in tag_list}
         dom = None
-        if "DomainId" in kv and kv["DomainId"] in doms:
-            dom = doms[kv["DomainId"]]
-        elif "DomainName" in kv and kv["DomainName"] in doms_by_name:
-            dom = doms_by_name[kv["DomainName"]]
+        if kv:
+            if "DomainId" in kv and kv["DomainId"] in doms:
+                dom = doms[kv["DomainId"]]
+            elif "DomainName" in kv and kv["DomainName"] in doms_by_name:
+                dom = doms_by_name[kv["DomainName"]]
+
         out.append({
             "name": p["PipelineName"],
             "arn": arn,
-            "lastModifiedTime": _iso(p.get("LastModifiedTime","")),
-            "tags": kv,
+            "lastModifiedTime": _iso(p.get("LastModifiedTime", "")),
+            "tags": (kv or None),  # ← 비어 있으면 None → JSON null
             "matchedDomain": ({"DomainId": dom["DomainId"], "DomainName": dom["DomainName"]} if dom else None)
         })
     return out
 
-def build_inventory(regions: Optional[List[str]] = None, profile: Optional[str] = None) -> Dict[str, Any]:
-    """
-    { regions: [ {region, domains:[...], pipelines:[...]} ] }
-    형태로 Region→Domain→Pipeline 인벤토리를 구성
-    """
-    if not regions:
-        regions = get_available_regions()
-    regions = sorted(set(regions))
-
-    inventory = []
-    for r in regions:
-        try:
-            doms = list_domains_in_region(r, profile)
-            doms_slim = [{"DomainId": d["DomainId"], "DomainName": d.get("DomainName","")} for d in doms]
-            pipes = list_pipelines_with_domain(r, profile)
-            inventory.append({
-                "region": r,
-                "domains": doms_slim,
-                "pipelines": pipes
-            })
-        except Exception as e:
-            inventory.append({
-                "region": r,
-                "error": str(e),
-                "domains": [],
-                "pipelines": []
-            })
-    return {"regions": inventory}
-
 # =======================================================
-# Function entry for API/Lambda/FastAPI to call
+# Entry used by API: build lineage graph for one pipeline
 # =======================================================
 
 def get_lineage_json(
@@ -571,7 +523,7 @@ def get_lineage_json(
     profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    기존 main()의 핵심 로직을 함수로 제공.
+    단건 파이프라인의 라인리지 그래프 데이터를 생성
     """
     # 세션 설정
     if profile:
@@ -630,7 +582,7 @@ def get_lineage_json(
     }
 
 # ---------------------------
-# Main (CLI)
+# Main (optional CLI)
 # ---------------------------
 
 def main():
