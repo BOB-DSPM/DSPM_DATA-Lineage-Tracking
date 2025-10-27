@@ -16,7 +16,7 @@ from lineage import (
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
-app = FastAPI(title="SageMaker Lineage API", version="1.3.0")
+app = FastAPI(title="SageMaker Lineage API", version="1.4.0")
 
 # CORS (운영에서는 특정 도메인만 허용 권장)
 app.add_middleware(
@@ -153,6 +153,7 @@ def lineage_endpoint(
     domain: str | None = Query(None, description="Optional SageMaker DomainName tag filter"),
     includeLatestExec: bool = Query(False, description="Include latest execution info"),
     profile: str | None = Query(None, description="Local dev only; AWS profile name"),
+    view: str = Query("both", regex="^(pipeline|data|both)$", description="pipeline | data | both"),  # 추가
 ):
     try:
         data = get_lineage_json(
@@ -161,6 +162,7 @@ def lineage_endpoint(
             domain_name=domain,
             include_latest_exec=includeLatestExec,
             profile=profile,
+            view=view, # 추가
         )
         return data
     except ValueError as ve:

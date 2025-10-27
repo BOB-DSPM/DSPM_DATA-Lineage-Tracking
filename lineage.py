@@ -228,6 +228,90 @@ def build_graph_from_definition(pdef: Dict[str, Any]) -> Dict[str, Any]:
     return {"nodes": nodes, "edges": edges, "artifacts": artifacts}
 
 # ---------------------------
+# Build DATA-centric graph (bipartite: process <-> data)
+# ---------------------------
+
+def build_data_view_graph(graph_pipeline: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    pipeline 그래프(graph_pipeline: nodes/edges/artifacts)를 이용해
+    데이터-중심 이분 그래프를 생성한다.
+    - process 노드: 기존 스텝
+    - data 노드: 유니크한 아티팩트(URI)
+    - edges: data->process(READ), process->data(WRITE)
+    """
+    nodes_p = graph_pipeline.get("nodes", [])
+    artifacts = graph_pipeline.get("artifacts", [])
+
+    # 1) data 노드 인덱스 (uri -> node)
+    data_nodes: Dict[str, Dict[str, Any]] = {}
+    def ensure_data_node(uri: str) -> Dict[str, Any]:
+        uid = f"data:{uri.lower().rstrip('/')}"
+        if uid not in data_nodes:
+            # 해당 uri의 S3 메타 찾기(있으면 노드 data.meta.s3로)
+            meta = {}
+            for a in artifacts:
+                if a.get("uri") == uri:
+                    if a.get("s3"):
+                        meta["s3"] = a["s3"]
+                    meta["bucket"] = a.get("bucket")
+                    meta["key"] = a.get("key")
+                    break
+            data_nodes[uid] = {
+                "id": uid,
+                "type": "dataArtifact",
+                "label": uri,
+                "uri": uri,
+                "meta": meta
+            }
+        return data_nodes[uid]
+
+    # 2) process 노드 구성(기존 스텝 재사용)
+    proc_nodes: List[Dict[str, Any]] = []
+    proc_index: Dict[str, Dict[str, Any]] = {}
+    for n in nodes_p:
+        pid = f"process:{n['id']}"
+        item = {
+            "id": pid,
+            "type": "processNode",
+            "label": n.get("label") or n["id"],
+            "stepId": n["id"],
+            "stepType": n.get("type"),
+            "run": n.get("run"),          # 상태/소요시간/메트릭 재사용
+            "registry": n.get("registry")
+        }
+        proc_nodes.append(item)
+        proc_index[n["id"]] = item
+
+    # 3) READ/WRITE 엣지 생성
+    edges: List[Dict[str, Any]] = []
+
+    def add_edge(src: str, dst: str, kind: str):
+        eid = f"e:{src}->{dst}:{kind}"
+        edges.append({"id": eid, "source": src, "target": dst, "kind": kind})
+
+    for n in nodes_p:
+        pid = f"process:{n['id']}"
+        # READ: inputs (data -> process)
+        for i in n.get("inputs", []):
+            u = i.get("uri")
+            if isinstance(u, str) and u:
+                dnode = ensure_data_node(u)
+                add_edge(dnode["id"], pid, "read")
+        # WRITE: outputs (process -> data)
+        for o in n.get("outputs", []):
+            u = o.get("uri")
+            if isinstance(u, str) and u:
+                dnode = ensure_data_node(u)
+                add_edge(pid, dnode["id"], "write")
+
+    # 4) 결과
+    data_nodes_list = list(data_nodes.values())
+    return {
+        "nodes": data_nodes_list + proc_nodes,
+        "edges": edges
+    }
+
+# ---------------------------
 # Enrich: latest execution (run info, metrics, registry)
 # ---------------------------
 
@@ -538,6 +622,7 @@ def get_lineage_json(
     domain_name: Optional[str] = None,
     include_latest_exec: bool = False,
     profile: Optional[str] = None,
+    view: str = "both",
 ) -> Dict[str, Any]:
     """
     단건 파이프라인의 라인리지 그래프 데이터를 생성
@@ -563,31 +648,39 @@ def get_lineage_json(
                 break
     if not target:
         raise ValueError(f"Pipeline '{pipeline_name}' not found or not tagged for the given domain.")
+    
+    # (2-1) 추가 확장 로직
+    graph_pipeline = build_graph_from_definition(pdef)
+    if include_latest_exec:
+        enrich_with_latest_execution(sm, pipeline_name, graph_pipeline)
+    dedupe_and_label_edges(graph_pipeline)
+    try:
+        enrich_eval_metrics_from_s3(session, graph_pipeline)
+    except Exception:
+        pass
+    enrich_artifact_s3_meta(graph_pipeline["artifacts"], session)
 
     # (3) 정의 → 그래프 구성
     pdef = get_pipeline_definition(sm, pipeline_name)
-    graph = build_graph_from_definition(pdef)
+    graph_pipeline = build_graph_from_definition(pdef)
 
     # (3-1) 최신 실행 보강
     if include_latest_exec:
-        enrich_with_latest_execution(sm, pipeline_name, graph)
-
-    # (3-2) 간선 중복/라벨 정리
-    dedupe_and_label_edges(graph)
-
-    # (3-3) Evaluate 리포트 지표(선택)
+        enrich_with_latest_execution(sm, pipeline_name, graph_pipeline)
+    dedupe_and_label_edges(graph_pipeline)
     try:
-        enrich_eval_metrics_from_s3(session, graph)
+        enrich_eval_metrics_from_s3(session, graph_pipeline)
     except Exception:
         pass
+    enrich_artifact_s3_meta(graph_pipeline["artifacts"], session)
 
-    # (3-4) S3 보안 메타(선택)
-    enrich_artifact_s3_meta(graph["artifacts"], session)
+    # (3-5) 요약(파이프라인 기준)
+    summary = pipeline_summary(graph_pipeline)
 
-    # (3-5) 요약
-    summary = pipeline_summary(graph)
+    # (3) 데이터-뷰 그래프 (필요 시)
+    graph_data = build_data_view_graph(graph_pipeline) if view in ("data", "both") else None
 
-    return {
+    result = {
         "domain": (selected or {}),
         "pipeline": {
             "name": target["PipelineName"],
@@ -595,8 +688,14 @@ def get_lineage_json(
             "lastModifiedTime": _iso(target.get("LastModifiedTime", "")),
         },
         "summary": summary,
-        "graph": graph
     }
+    if view in ("pipeline", "both"):
+        result["graphPipeline"] = graph_pipeline
+        result["graph"] = graph_pipeline
+    if view in ("data", "both"):
+        result["graphData"] = graph_data
+
+    return result
 
 # ---------------------------
 # Main (optional CLI)
