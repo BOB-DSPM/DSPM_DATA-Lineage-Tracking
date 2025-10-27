@@ -1,5 +1,8 @@
 import argparse, json, sys, re, datetime as dt
 from typing import Dict, List, Any, Tuple, Optional
+from lineage_ext.flags import ExtFlags
+from lineage_ext.collectors import collect_catalog   # Glue/Registry/Endpoint/FeatureStore 수집
+from lineage_ext.builders import build_data_view_graph_ext  # 데이터-뷰 빌더
 import boto3
 import botocore
 
@@ -680,6 +683,22 @@ def get_lineage_json(
     # (3) 데이터-뷰 그래프 (필요 시)
     graph_data = build_data_view_graph(graph_pipeline) if view in ("data", "both") else None
 
+    # ★ 신규: 확장 플래그 로드
+    flags = ExtFlags.from_env()
+
+    # ★ 신규: 외부 메타 카탈로그 수집(옵션, 실패 허용)
+    catalog = {}
+    if view in ("data", "both"):
+        try:
+            catalog = collect_catalog(session, sm_client=sm, flags=flags, base_graph=graph_pipeline)
+        except Exception:
+            catalog = {}
+
+    # ★ 신규: 데이터-뷰 그래프 생성(이분그래프 + 확장 엔티티/관계)
+    graph_data = None
+    if view in ("data", "both"):
+        graph_data = build_data_view_graph_ext(graph_pipeline, catalog=catalog, flags=flags)
+
     result = {
         "domain": (selected or {}),
         "pipeline": {
@@ -694,6 +713,7 @@ def get_lineage_json(
         result["graph"] = graph_pipeline
     if view in ("data", "both"):
         result["graphData"] = graph_data
+        result["catalog"] = catalog
 
     return result
 
