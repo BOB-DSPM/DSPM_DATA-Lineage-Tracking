@@ -4,14 +4,13 @@ from typing import Optional, List, Dict, Any
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from lineage import (
-    get_lineage_json,           # 단건 라인리지 그래프 생성
-    list_pipelines_with_domain, # 파이프라인 목록 + 태그/도메인 매핑
-)
+# ⚠️ 함수 직접 임포트 대신 모듈 별칭으로 임포트해 충돌/순환 import 방지
+import lineage as lineage_lib
 
 # -----------------------------------------------------------------------------
 # FastAPI app
@@ -78,7 +77,6 @@ def _get_latest_pipeline_execution(sm, pipeline_name: str) -> Dict[str, Any]:
 def health():
     return {"status": "ok", "version": app.version}
 
-
 # -----------------------------------------------------------------------------
 # 1) pipelines: 파이프라인 목록 + 태그/도메인 매핑
 # -----------------------------------------------------------------------------
@@ -94,8 +92,6 @@ def sagemaker_pipelines(
     """
     리전별 '파이프라인 목록만' 반환. 각 파이프라인에는 태그 기반으로
     matchedDomain: {DomainId, DomainName} 가 매핑되어 함께 포함된다.
-    - name, domainName, domainId 로 필터링 가능
-    - includeLatestExec=true 이면 latestExecution 요약도 덧붙임
     """
     try:
         region_list = _parse_regions(regions, profile)
@@ -103,10 +99,8 @@ def sagemaker_pipelines(
 
         for r in region_list:
             try:
-                # 태그 + matchedDomain 포함하여 가져오기
-                pipes = list_pipelines_with_domain(region=r, profile=profile)
+                pipes = lineage_lib.list_pipelines_with_domain(region=r, profile=profile)
 
-                # 이름/도메인 필터
                 if name:
                     s = name.lower()
                     pipes = [p for p in pipes if s in p["name"].lower()]
@@ -122,7 +116,6 @@ def sagemaker_pipelines(
                         or ((p.get("tags") or {}).get("DomainId") == domainId)
                     ]
 
-                # 최신 실행 1건 요약 추가
                 if includeLatestExec:
                     sess = boto3.session.Session(profile_name=profile, region_name=r) if profile \
                         else boto3.session.Session(region_name=r)
@@ -142,7 +135,6 @@ def sagemaker_pipelines(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"sagemaker pipelines error: {e}")
 
-
 # -----------------------------------------------------------------------------
 # 2) 단건 라인리지 그래프
 # -----------------------------------------------------------------------------
@@ -153,23 +145,28 @@ def lineage_endpoint(
     domain: str | None = Query(None, description="Optional SageMaker DomainName tag filter"),
     includeLatestExec: bool = Query(False, description="Include latest execution info"),
     profile: str | None = Query(None, description="Local dev only; AWS profile name"),
-    view: str = Query("both", regex="^(pipeline|data|both)$", description="pipeline | data | both"),  # 추가
+    view: str = Query("both", regex="^(pipeline|data|both)$", description="pipeline | data | both"),
 ):
     try:
-        data = get_lineage_json(
+        data = lineage_lib.get_lineage_json(
             region=region,
             pipeline_name=pipeline,
             domain_name=domain,
             include_latest_exec=includeLatestExec,
             profile=profile,
-            view=view, # 추가
+            view=view,
         )
         return data
     except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve))
+    except ClientError as ce:
+        err = ce.response.get("Error", {})
+        raise HTTPException(
+            status_code=502,
+            detail={"type":"AWSClientError","code":err.get("Code"),"message":err.get("Message")}
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"internal error: {e}")
-
+        raise HTTPException(status_code=500, detail={"type":"ServerError","message":str(e)})
 
 # -----------------------------------------------------------------------------
 # 3) 도메인에 매칭되는 모든 파이프라인 라인리지
@@ -180,17 +177,14 @@ def lineage_by_domain(
     domain: str = Query(..., description="DomainName"),
     includeLatestExec: bool = Query(False),
     profile: str | None = Query(None),
+    view: str = Query("both", regex="^(pipeline|data|both)$"),
 ):
     """
     해당 리전에서 DomainName 태그가 일치하는 파이프라인들을 전부 찾아
     각각의 라인리지를 수행해 한번에 반환
-    (build_inventory 의존 제거 버전)
     """
     try:
-        # 1) 해당 리전의 파이프라인 + 태그 조회
-        pipes = list_pipelines_with_domain(region=region, profile=profile)
-
-        # 2) DomainName=... 태그가 있는 파이프라인만 남기기
+        pipes = lineage_lib.list_pipelines_with_domain(region=region, profile=profile)
         targets = [
             p["name"] for p in pipes
             if (p.get("matchedDomain") and p["matchedDomain"].get("DomainName") == domain)
@@ -199,16 +193,16 @@ def lineage_by_domain(
         if not targets:
             raise HTTPException(status_code=404, detail=f"no pipelines tagged with DomainName={domain} in {region}")
 
-        # 3) 각 파이프라인의 라인리지 생성
         results = []
         for name in targets:
             try:
-                data = get_lineage_json(
+                data = lineage_lib.get_lineage_json(
                     region=region,
                     pipeline_name=name,
                     domain_name=domain,
                     include_latest_exec=includeLatestExec,
                     profile=profile,
+                    view=view,
                 )
                 results.append({"pipeline": name, "ok": True, "data": data})
             except Exception as e:
@@ -220,10 +214,9 @@ def lineage_by_domain(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"by-domain error: {e}")
 
-
 # -----------------------------------------------------------------------------
 # Entrypoint
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # uvicorn 실행 옵션은 환경/도커에 맞게 조정하세요
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 개발 기본 포트 8300 (로그 일관)
+    uvicorn.run(app, host="0.0.0.0", port=8300)

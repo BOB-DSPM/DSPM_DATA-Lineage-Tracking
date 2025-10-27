@@ -90,7 +90,7 @@ def get_pipeline_definition(sm, pipeline_name: str) -> dict:
             except Exception: return {}
         return {}
 
-    # (A) get_pipeline: 일부 오래된 boto3엔 없을 수 있으니 try만
+    # (A) get_pipeline
     try:
         r = sm.get_pipeline(PipelineName=pipeline_name)
         for k in ("PipelineDefinition", "PipelineDefinitionDocument", "PipelineDefinitionBody"):
@@ -127,7 +127,6 @@ def normalize_step_io(step: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[
     inputs, outputs = [], []
 
     def add(uri: Optional[Any], io_type: str, name: str):
-        # uri: str (s3) 또는 dict(ref) 모두 허용
         if uri is None: return
         (inputs if io_type == "input" else outputs).append({"name": name, "uri": uri})
 
@@ -175,9 +174,7 @@ def build_graph_from_definition(pdef: Dict[str, Any]) -> Dict[str, Any]:
         or []
     )
 
-    nodes: List[Dict[str, Any]] = []
-    edges: List[Dict[str, Any]] = []
-    artifacts: List[Dict[str, Any]] = []
+    nodes, edges, artifacts = [], [], []
     artifact_index: Dict[str, int] = {}
     next_artifact_id = 0
 
@@ -191,7 +188,10 @@ def build_graph_from_definition(pdef: Dict[str, Any]) -> Dict[str, Any]:
         return artifact_index[uri]
 
     for s in steps:
-        node_id = s["Name"]
+        node_id = s.get("Name")
+        if not node_id:
+            continue
+
         stype   = s.get("Type")
         depends = s.get("DependsOn", [])
         ins, outs = normalize_step_io(s)
@@ -235,9 +235,6 @@ def build_data_view_graph(graph_pipeline: Dict[str, Any]) -> Dict[str, Any]:
     """
     pipeline 그래프(graph_pipeline: nodes/edges/artifacts)를 이용해
     데이터-중심 이분 그래프를 생성한다.
-    - process 노드: 기존 스텝
-    - data 노드: 유니크한 아티팩트(URI)
-    - edges: data->process(READ), process->data(WRITE)
     """
     nodes_p = graph_pipeline.get("nodes", [])
     artifacts = graph_pipeline.get("artifacts", [])
@@ -247,7 +244,6 @@ def build_data_view_graph(graph_pipeline: Dict[str, Any]) -> Dict[str, Any]:
     def ensure_data_node(uri: str) -> Dict[str, Any]:
         uid = f"data:{uri.lower().rstrip('/')}"
         if uid not in data_nodes:
-            # 해당 uri의 S3 메타 찾기(있으면 노드 data.meta.s3로)
             meta = {}
             for a in artifacts:
                 if a.get("uri") == uri:
@@ -265,7 +261,7 @@ def build_data_view_graph(graph_pipeline: Dict[str, Any]) -> Dict[str, Any]:
             }
         return data_nodes[uid]
 
-    # 2) process 노드 구성(기존 스텝 재사용)
+    # 2) process 노드 구성
     proc_nodes: List[Dict[str, Any]] = []
     proc_index: Dict[str, Dict[str, Any]] = {}
     for n in nodes_p:
@@ -276,7 +272,7 @@ def build_data_view_graph(graph_pipeline: Dict[str, Any]) -> Dict[str, Any]:
             "label": n.get("label") or n["id"],
             "stepId": n["id"],
             "stepType": n.get("type"),
-            "run": n.get("run"),          # 상태/소요시간/메트릭 재사용
+            "run": n.get("run"),
             "registry": n.get("registry")
         }
         proc_nodes.append(item)
@@ -291,25 +287,19 @@ def build_data_view_graph(graph_pipeline: Dict[str, Any]) -> Dict[str, Any]:
 
     for n in nodes_p:
         pid = f"process:{n['id']}"
-        # READ: inputs (data -> process)
         for i in n.get("inputs", []):
             u = i.get("uri")
             if isinstance(u, str) and u:
                 dnode = ensure_data_node(u)
                 add_edge(dnode["id"], pid, "read")
-        # WRITE: outputs (process -> data)
         for o in n.get("outputs", []):
             u = o.get("uri")
             if isinstance(u, str) and u:
                 dnode = ensure_data_node(u)
                 add_edge(pid, dnode["id"], "write")
 
-    # 4) 결과
     data_nodes_list = list(data_nodes.values())
-    return {
-        "nodes": data_nodes_list + proc_nodes,
-        "edges": edges
-    }
+    return {"nodes": data_nodes_list + proc_nodes, "edges": edges}
 
 # ---------------------------
 # Enrich: latest execution (run info, metrics, registry)
@@ -320,13 +310,14 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
         ex_summ = sm.list_pipeline_executions(
             PipelineName=pipeline_name, SortBy="CreationTime", SortOrder="Descending", MaxResults=1
         ).get("PipelineExecutionSummaries", [])
-        if not ex_summ: return
-        exec_arn = ex_summ[0]["PipelineExecutionArn"]
+        if not ex_summ:
+            return
+        exec_arn = ex_summ[0].get("PipelineExecutionArn")
+        if not exec_arn:
+            return
 
-        steps = sm.list_pipeline_execution_steps(PipelineExecutionArn=exec_arn)\
-                  .get("PipelineExecutionSteps", [])
-
-        node_map = {n["id"]: n for n in graph["nodes"]}
+        steps = sm.list_pipeline_execution_steps(PipelineExecutionArn=exec_arn).get("PipelineExecutionSteps", []) or []
+        node_map = {n.get("id"): n for n in graph.get("nodes", []) if n.get("id")}
 
         for st in steps:
             name = st.get("StepName")
@@ -435,7 +426,6 @@ def dedupe_and_label_edges(graph: Dict[str, Any]) -> None:
         if key in seen:
             continue
         seen.add(key)
-        # 라벨 후보
         names = input_names.get(e["to"], [])
         names = [x for x in names if x != "code" and not str(x).startswith("input-")]
         if names:
@@ -557,15 +547,12 @@ def enrich_artifact_s3_meta(artifacts: List[Dict[str,Any]], session: boto3.sessi
 def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     리전 내 파이프라인 + 태그를 함께 반환
-    - matchedDomain: 파이프라인 태그에 DomainId/DomainName가 있으면 채워짐
-    - tags: 비어 있으면 None(JSON에서는 null)
     """
     if profile:
         boto3.setup_default_session(profile_name=profile, region_name=region)
     sm = boto3.client("sagemaker", region_name=region)
 
     def _domain_id_from_arn(arn: str) -> Optional[str]:
-        # arn:aws:sagemaker:ap-northeast-2:acct:domain/d-xxxxxxxxxxxx
         try:
             part = arn.split(":")[5]          # 'domain/d-xxxx'
             return part.split("/", 1)[1]      # 'd-xxxx'
@@ -573,8 +560,6 @@ def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> Li
             return None
 
     pipes = list_all_pipelines(sm)
-
-    # 미리 도메인 캐시
     doms = { d["DomainId"]: d for d in list_domains(sm) }
     doms_by_name = { d.get("DomainName"): d for d in doms.values() if d.get("DomainName") }
 
@@ -585,16 +570,14 @@ def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> Li
             tag_list = sm.list_tags(ResourceArn=arn).get("Tags", [])
         except Exception:
             tag_list = []
-        kv = {t["Key"]: t["Value"] for t in tag_list}  # 원본 태그
+        kv = {t["Key"]: t["Value"] for t in tag_list}
 
         dom = None
-        # 1) 명시적 태그 우선
         if "DomainId" in kv and kv["DomainId"] in doms:
             dom = doms[kv["DomainId"]]
         elif "DomainName" in kv and kv["DomainName"] in doms_by_name:
             dom = doms_by_name[kv["DomainName"]]
         else:
-            # 2) 스튜디오 자동태그로 추론 (sagemaker:domain-arn)
             d_arn = kv.get("sagemaker:domain-arn")
             d_id = _domain_id_from_arn(d_arn) if d_arn else None
             if d_id and d_id in doms:
@@ -604,7 +587,7 @@ def list_pipelines_with_domain(region: str, profile: Optional[str] = None) -> Li
             "name": p["PipelineName"],
             "arn": arn,
             "lastModifiedTime": _iso(p.get("LastModifiedTime","")),
-            "tags": (kv or None),  # 비어있으면 null
+            "tags": (kv or None),
             "matchedDomain": (
                 {"DomainId": dom["DomainId"], "DomainName": dom.get("DomainName")}
                 if dom else None
@@ -622,7 +605,7 @@ def get_lineage_json(
     domain_name: Optional[str] = None,
     include_latest_exec: bool = False,
     profile: Optional[str] = None,
-    view: str = "both",
+    view: str = "both",  # "pipeline" | "data" | "both"
 ) -> Dict[str, Any]:
     """
     단건 파이프라인의 라인리지 그래프 데이터를 생성
@@ -648,23 +631,19 @@ def get_lineage_json(
                 break
     if not target:
         raise ValueError(f"Pipeline '{pipeline_name}' not found or not tagged for the given domain.")
-    
-    # (2-1) 추가 확장 로직
-    graph_pipeline = build_graph_from_definition(pdef)
-    if include_latest_exec:
-        enrich_with_latest_execution(sm, pipeline_name, graph_pipeline)
-    dedupe_and_label_edges(graph_pipeline)
-    try:
-        enrich_eval_metrics_from_s3(session, graph_pipeline)
-    except Exception:
-        pass
-    enrich_artifact_s3_meta(graph_pipeline["artifacts"], session)
 
-    # (3) 정의 → 그래프 구성
+    # (3) 정의 → 그래프 구성 (먼저 pdef부터!)
     pdef = get_pipeline_definition(sm, pipeline_name)
+    if not pdef or not any(
+        (pdef.get("Steps"),
+         (pdef.get("PipelineDefinition") or {}).get("Steps"),
+         (pdef.get("Definition") or {}).get("Steps"))
+    ):
+        raise ValueError(f"Pipeline '{pipeline_name}' has no retrievable definition (Steps empty).")
+
     graph_pipeline = build_graph_from_definition(pdef)
 
-    # (3-1) 최신 실행 보강
+    # (3-1) 최신 실행 보강 / 라벨정리 / 평가지표 / S3 메타
     if include_latest_exec:
         enrich_with_latest_execution(sm, pipeline_name, graph_pipeline)
     dedupe_and_label_edges(graph_pipeline)
@@ -674,10 +653,10 @@ def get_lineage_json(
         pass
     enrich_artifact_s3_meta(graph_pipeline["artifacts"], session)
 
-    # (3-5) 요약(파이프라인 기준)
+    # (3-2) 요약(파이프라인 기준)
     summary = pipeline_summary(graph_pipeline)
 
-    # (3) 데이터-뷰 그래프 (필요 시)
+    # (3-3) 데이터-뷰 그래프 (요청 시)
     graph_data = build_data_view_graph(graph_pipeline) if view in ("data", "both") else None
 
     result = {
@@ -708,6 +687,7 @@ def main():
     ap.add_argument("--domain-name", help="파이프라인에 달아둔 Tag(DomainName)로 필터링")
     ap.add_argument("--include-latest-exec", action="store_true", help="가장 최근 실행 정보를 반영해 입출력/지표 보강")
     ap.add_argument("--profile", help="AWS 프로필명(선택)")
+    ap.add_argument("--view", choices=["pipeline","data","both"], default="both")
     ap.add_argument("--out", help="JSON 파일로 저장 경로(선택)")
     args = ap.parse_args()
 
@@ -717,6 +697,7 @@ def main():
         domain_name=args.domain_name,
         include_latest_exec=args.include_latest_exec,
         profile=args.profile,
+        view=args.view,
     )
 
     text = json.dumps(data, indent=2, ensure_ascii=False)
