@@ -23,6 +23,9 @@ htmlcov/
 .coverage*
 .tox/
 .nox/
+scripts/
+data/
+*.jsonl
 
 # 편집기/IDE 설정(공유 필요 없다면 제외)
 .vscode/

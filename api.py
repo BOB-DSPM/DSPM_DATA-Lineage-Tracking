@@ -8,6 +8,10 @@ from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+from modules.schema_sampler import sample_schema, parse_s3_uri
+from modules.schema_store import save_schema, dataset_id_from_s3, get_version, list_versions
+from modules.sql_lineage_light import extract_lineage
+from modules.featurestore_schema import describe_feature_group, list_feature_groups
 
 # ⚠️ 함수 직접 임포트 대신 모듈 별칭으로 임포트해 충돌/순환 import 방지
 import lineage as lineage_lib
@@ -213,6 +217,70 @@ def lineage_by_domain(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"by-domain error: {e}")
+
+# ... FastAPI app 생성 코드 뒤에 아래 라우트들 추가 ...
+
+@app.post("/datasets/schema/scan")
+def scan_dataset_schema(
+    region: str = Query(..., description="e.g., ap-northeast-2"),
+    s3_uri: str = Query(..., description="s3://bucket/prefix"),
+    max_objects: int = Query(5, ge=1, le=50),
+    max_bytes: int = Query(256*1024, ge=4096, le=5*1024*1024),
+):
+    """
+    S3 prefix에서 소량 샘플을 읽어 JSON/CSV(+Parquet) 스키마를 추출하고 버전으로 저장.
+    Confidence=Medium, Evidence=s3:getobject(sample)
+    """
+    sch = sample_schema(region=region, s3_uri=s3_uri, max_objects=max_objects, max_bytes=max_bytes)
+    b, p = parse_s3_uri(s3_uri)
+    dsid = dataset_id_from_s3(b, p)
+    policy = {"region": region, "s3_uri": s3_uri, "max_objects": max_objects, "max_bytes": max_bytes}
+    rec = save_schema(dsid, sch, policy)
+    return {"ok": True, "dataset_id": dsid, "version": rec["version"], "schema": sch}
+
+@app.get("/datasets/{bucket}/{prefix:path}/schema")
+def get_dataset_schema(bucket: str, prefix: str, version: int | None = None):
+    """
+    저장된 스키마 버전 조회(미지정 시 최신)
+    """
+    dsid = dataset_id_from_s3(bucket, prefix)
+    rec = get_version(dsid, version)
+    if not rec:
+        raise HTTPException(404, f"schema not found: {dsid}")
+    return {"dataset_id": dsid, "version": rec["version"], "policy": rec["policy"], "schema": rec["schema"]}
+
+@app.get("/datasets/{bucket}/{prefix:path}/schema/versions")
+def list_dataset_schema_versions(bucket: str, prefix: str):
+    dsid = dataset_id_from_s3(bucket, prefix)
+    vers = list_versions(dsid)
+    return [{"version": v["version"], "sampled_at": v["sampled_at"], "policy": v["policy"]} for v in vers]
+
+@app.post("/sql/lineage")
+def post_sql_lineage(sql: str):
+    """
+    간이 SQL → 컬럼 라인리지(라이트 파서).
+    정확도 향상하려면 sqlglot 기반 파서로 교체 권장.
+    """
+    out = extract_lineage(sql)
+    if not out:
+        return {"ok": False, "note": "unsupported or parse failed"}
+    return {"ok": True, **out}
+
+@app.get("/featurestore/feature-groups")
+def api_list_feature_groups(
+    region: str,
+    profile: str | None = None,
+    nameContains: str | None = None,
+):
+    return {"items": list_feature_groups(region=region, profile=profile, name_contains=nameContains)}
+
+@app.get("/featurestore/feature-groups/{name}")
+def api_describe_feature_group(
+    name: str,
+    region: str,
+    profile: str | None = None,
+):
+    return describe_feature_group(region=region, name=name, profile=profile)
 
 # -----------------------------------------------------------------------------
 # Entrypoint
