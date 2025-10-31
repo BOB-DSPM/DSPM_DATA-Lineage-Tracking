@@ -3,3 +3,4 @@ uvicorn
 boto3
 botocore
 pyarrow>=12
+sqlglot>=23

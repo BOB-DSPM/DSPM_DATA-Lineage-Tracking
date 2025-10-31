@@ -2,12 +2,14 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 
 # 가상환경
 .venv/
 venv/
 ENV/
 env/
+pyvenv.cfg
 
 # 패키징/빌드
 build/
@@ -38,6 +40,8 @@ Thumbs.db
 desktop.ini
 
 # 로그/임시
+logs/
+.vscode/
 *.log
 *.tmp
 *.swp

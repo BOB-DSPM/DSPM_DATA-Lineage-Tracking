@@ -1,5 +1,6 @@
 import argparse, json, sys, re, datetime as dt
 from typing import Dict, List, Any, Tuple, Optional
+from modules.sql_lineage_store import latest_by_step
 import boto3
 import botocore
 
@@ -675,6 +676,25 @@ def get_lineage_json(
         result["graphData"] = graph_data
 
     return result
+
+# ---------------------------
+# Enrich nodes with SQL lineage info
+# ---------------------------
+
+def enrich_nodes_with_sql(nodes: list[dict], pipeline: str) -> list[dict]:
+    for n in nodes:
+        step = n.get("label") or n.get("id")
+        rec = latest_by_step(pipeline, step) if step else None
+        if not rec:
+            n["hasSql"] = False
+            continue
+        p = rec.get("parsed", {})
+        n["hasSql"] = True
+        n["sqlDst"] = p.get("dst")
+        n["sqlSources"] = p.get("sources", [])
+        cols = p.get("columns", [])
+        n["sqlColumns"] = [c.get("dst") or c.get("src") for c in cols][:5]
+    return nodes
 
 # ---------------------------
 # Main (optional CLI)

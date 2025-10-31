@@ -1,59 +1,60 @@
 from __future__ import annotations
-
 from typing import Optional, List, Dict, Any
-
-import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from pydantic import BaseModel
+import os
+import boto3
 import uvicorn
+import shutil
+
+# --- Internal modules ---
 from modules.schema_sampler import sample_schema, parse_s3_uri
 from modules.schema_store import save_schema, dataset_id_from_s3, get_version, list_versions
-from modules.sql_lineage_light import extract_lineage
 from modules.featurestore_schema import describe_feature_group, list_feature_groups
+from modules.sql_collector import collect_from_repo
+from modules.sql_lineage_store import put, get_by_pipeline, get_by_job
+from modules.connectors.git_fetch import shallow_clone
+from modules.sql_try import try_parse
 
-# ⚠️ 함수 직접 임포트 대신 모듈 별칭으로 임포트해 충돌/순환 import 방지
+# 순환 import 방지용 별칭 임포트
 import lineage as lineage_lib
 
-# -----------------------------------------------------------------------------
-# FastAPI app
-# -----------------------------------------------------------------------------
-app = FastAPI(title="SageMaker Lineage API", version="1.4.0")
+# -----------------------------------------------------------------------------#
+# FastAPI
+# -----------------------------------------------------------------------------#
+app = FastAPI(title="SageMaker Lineage API", version="1.5.1")
 
-# CORS (운영에서는 특정 도메인만 허용 권장)
+# CORS (운영 시 특정 도메인으로 제한 권장)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["*"],      # ← POST/OPTIONS 모두 허용
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 # boto3 공통 설정
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 _BOTO_CFG = Config(
     retries={"max_attempts": 5, "mode": "adaptive"},
     connect_timeout=5,
     read_timeout=60,
 )
 
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 # Utils
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 def _parse_regions(regions: Optional[str], profile: Optional[str]) -> List[str]:
-    """
-    regions 쿼리가 있으면 그것을 사용,
-    없으면 boto3 Session에서 sagemaker 지원 모든 리전을 반환
-    """
+    """regions 쿼리가 있으면 그것을 사용, 없으면 SageMaker 지원 모든 리전 반환"""
     if regions:
-        parsed = [r.strip() for r in regions.split(",") if r.strip()]
-    else:
-        sess = boto3.session.Session(profile_name=profile) if profile else boto3.session.Session()
-        parsed = sess.get_available_regions("sagemaker")
-    return parsed
-
+        return [r.strip() for r in regions.split(",") if r.strip()]
+    sess = boto3.session.Session(profile_name=profile) if profile else boto3.session.Session()
+    return sess.get_available_regions("sagemaker")
 
 def _get_latest_pipeline_execution(sm, pipeline_name: str) -> Dict[str, Any]:
     """최신 파이프라인 실행 1건 요약"""
@@ -74,16 +75,23 @@ def _get_latest_pipeline_execution(sm, pipeline_name: str) -> Dict[str, Any]:
         "lastModifiedTime": x.get("LastUpdatedTime").isoformat() if x.get("LastUpdatedTime") else None
     }
 
-# -----------------------------------------------------------------------------
-# 0) Health Check
-# -----------------------------------------------------------------------------
+def guess_step_from_path(path: str, pipeline: str) -> str:
+    import re, os as _os
+    base = _os.path.basename(path or "")
+    m = re.match(r"(\d+_)?([a-zA-Z0-9\-_]+)", base)
+    step = (m.group(2) if m else base).replace(".sql", "").replace(".py", "")
+    return step
+
+# -----------------------------------------------------------------------------#
+# 0) Health
+# -----------------------------------------------------------------------------#
 @app.get("/health")
 def health():
     return {"status": "ok", "version": app.version}
 
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 # 1) pipelines: 파이프라인 목록 + 태그/도메인 매핑
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 @app.get("/sagemaker/pipelines")
 def sagemaker_pipelines(
     regions: Optional[str] = Query(None, description="쉼표구분 리전 목록. 없으면 SageMaker 지원 리전 전체"),
@@ -93,10 +101,6 @@ def sagemaker_pipelines(
     domainName: Optional[str] = Query(None, description="태그 DomainName=... 으로 필터(선택)"),
     domainId: Optional[str] = Query(None, description="태그 DomainId=... 으로 필터(선택)"),
 ):
-    """
-    리전별 '파이프라인 목록만' 반환. 각 파이프라인에는 태그 기반으로
-    matchedDomain: {DomainId, DomainName} 가 매핑되어 함께 포함된다.
-    """
     try:
         region_list = _parse_regions(regions, profile)
         out: List[Dict[str, Any]] = []
@@ -111,8 +115,8 @@ def sagemaker_pipelines(
                 if domainName:
                     dn = domainName.lower()
                     pipes = [p for p in pipes
-                            if (p.get("matchedDomain") and p["matchedDomain"].get("DomainName","").lower() == dn)
-                            or ((p.get("tags") or {}).get("DomainName","").lower() == dn)]
+                             if (p.get("matchedDomain") and p["matchedDomain"].get("DomainName","").lower() == dn)
+                             or ((p.get("tags") or {}).get("DomainName","").lower() == dn)]
                 if domainId:
                     pipes = [
                         p for p in pipes
@@ -139,9 +143,9 @@ def sagemaker_pipelines(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"sagemaker pipelines error: {e}")
 
-# -----------------------------------------------------------------------------
-# 2) 단건 라인리지 그래프
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# 2) 단건 라인리지
+# -----------------------------------------------------------------------------#
 @app.get("/lineage")
 def lineage_endpoint(
     pipeline: str = Query(..., description="SageMaker Pipeline Name"),
@@ -172,9 +176,9 @@ def lineage_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail={"type":"ServerError","message":str(e)})
 
-# -----------------------------------------------------------------------------
-# 3) 도메인에 매칭되는 모든 파이프라인 라인리지
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# 3) 도메인 내 모든 파이프라인 라인리지
+# -----------------------------------------------------------------------------#
 @app.get("/lineage/by-domain")
 def lineage_by_domain(
     region: str = Query(..., description="리전"),
@@ -183,10 +187,6 @@ def lineage_by_domain(
     profile: str | None = Query(None),
     view: str = Query("both", regex="^(pipeline|data|both)$"),
 ):
-    """
-    해당 리전에서 DomainName 태그가 일치하는 파이프라인들을 전부 찾아
-    각각의 라인리지를 수행해 한번에 반환
-    """
     try:
         pipes = lineage_lib.list_pipelines_with_domain(region=region, profile=profile)
         targets = [
@@ -218,8 +218,9 @@ def lineage_by_domain(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"by-domain error: {e}")
 
-# ... FastAPI app 생성 코드 뒤에 아래 라우트들 추가 ...
-
+# -----------------------------------------------------------------------------#
+# 4) Dataset schema endpoints
+# -----------------------------------------------------------------------------#
 @app.post("/datasets/schema/scan")
 def scan_dataset_schema(
     region: str = Query(..., description="e.g., ap-northeast-2"),
@@ -227,10 +228,7 @@ def scan_dataset_schema(
     max_objects: int = Query(5, ge=1, le=50),
     max_bytes: int = Query(256*1024, ge=4096, le=5*1024*1024),
 ):
-    """
-    S3 prefix에서 소량 샘플을 읽어 JSON/CSV(+Parquet) 스키마를 추출하고 버전으로 저장.
-    Confidence=Medium, Evidence=s3:getobject(sample)
-    """
+    """S3 prefix에서 샘플을 읽어 JSON/CSV(+Parquet) 스키마 추출 후 버전으로 저장"""
     sch = sample_schema(region=region, s3_uri=s3_uri, max_objects=max_objects, max_bytes=max_bytes)
     b, p = parse_s3_uri(s3_uri)
     dsid = dataset_id_from_s3(b, p)
@@ -240,9 +238,7 @@ def scan_dataset_schema(
 
 @app.get("/datasets/{bucket}/{prefix:path}/schema")
 def get_dataset_schema(bucket: str, prefix: str, version: int | None = None):
-    """
-    저장된 스키마 버전 조회(미지정 시 최신)
-    """
+    """저장된 스키마 버전 조회(미지정 시 최신)"""
     dsid = dataset_id_from_s3(bucket, prefix)
     rec = get_version(dsid, version)
     if not rec:
@@ -255,17 +251,16 @@ def list_dataset_schema_versions(bucket: str, prefix: str):
     vers = list_versions(dsid)
     return [{"version": v["version"], "sampled_at": v["sampled_at"], "policy": v["policy"]} for v in vers]
 
+# -----------------------------------------------------------------------------#
+# 5) SQL 단건 파싱 테스트
+# -----------------------------------------------------------------------------#
 @app.post("/sql/lineage")
-def post_sql_lineage(sql: str):
-    """
-    간이 SQL → 컬럼 라인리지(라이트 파서).
-    정확도 향상하려면 sqlglot 기반 파서로 교체 권장.
-    """
-    out = extract_lineage(sql)
-    if not out:
-        return {"ok": False, "note": "unsupported or parse failed"}
-    return {"ok": True, **out}
+def api_sql_lineage(sql: str = Query(...), dialect: str | None = Query(None)):
+    return try_parse(sql, dialect=dialect)
 
+# -----------------------------------------------------------------------------#
+# 6) Feature Store helpers
+# -----------------------------------------------------------------------------#
 @app.get("/featurestore/feature-groups")
 def api_list_feature_groups(
     region: str,
@@ -282,9 +277,137 @@ def api_describe_feature_group(
 ):
     return describe_feature_group(region=region, name=name, profile=profile)
 
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# 7) SQL 자동 수집 (repo_path or git_url)
+# -----------------------------------------------------------------------------#
+USE_SQL_AUTOCOLLECT = os.getenv("USE_SQL_AUTOCOLLECT", "true").lower() == "true"
+
+if USE_SQL_AUTOCOLLECT:
+
+    @app.post("/tasks/sql/refresh")
+    def refresh_sql_lineage(
+        # A) 기존 로컬 경로 방식
+        repo_path: str | None = Query(None, description="레포 루트 경로"),
+
+        # B) 원격 Git 방식
+        git_url: str | None = Query(None, description="Git HTTPS URL"),
+        branch: str = Query("main", description="Git branch"),
+        subdir: str | None = Query(None, description="Git sub-directory (예: models)"),
+        token: str | None = Query(None, description="Git token/PAT (필요 시)"),
+
+        # 공통
+        pipeline: str = Query(...),
+        job_id: str | None = Query(None),
+        dialect: str | None = Query(None),
+    ):
+        """
+        repo_path 또는 git_url 중 '하나'는 필수.
+        수집된 SQL은 try_parse → put() 으로 저장합니다.
+        """
+        if (repo_path is None) and (git_url is None):
+            raise HTTPException(status_code=400, detail="repo_path or git_url required")
+
+        tmp_dir: Path | None = None
+        try:
+            # 1) 소스 결정
+            if git_url:
+                tmp_dir = shallow_clone(git_url=git_url, branch=branch, subdir=subdir, token=token)
+                scan_root = str(tmp_dir)  # collect_from_repo는 str 경로 기대
+            else:
+                scan_root_path = Path(repo_path).expanduser().resolve()
+                if not scan_root_path.exists():
+                    raise HTTPException(status_code=404, detail=f"repo_path not found: {scan_root_path}")
+                scan_root = str(scan_root_path)
+
+            # 2) 수집 → 파싱 → 저장
+            items = collect_from_repo(scan_root)
+            saved = 0
+            for it in items:
+                parsed = try_parse(it.get("sql", ""), dialect=dialect)
+                if not parsed.get("ok"):
+                    continue
+                rec = {
+                    "pipeline": pipeline,
+                    "step": guess_step_from_path(it.get("file", ""), pipeline),
+                    "job_id": job_id,
+                    "file": it.get("file"),
+                    "sql": it.get("sql"),
+                    "parsed": parsed,
+                }
+                put(rec)
+                saved += 1
+
+            return {"ok": True, "saved": saved, "pipeline": pipeline}
+
+        finally:
+            # 3) 임시 깃 클론 디렉터리 정리
+            if tmp_dir and tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @app.get("/jobs/{job_id}/sql-lineage")
+    def sql_lineage_by_job(job_id: str):
+        return {"ok": True, "job_id": job_id, "items": get_by_job(job_id)}
+
+    @app.get("/pipelines/{name}/sql-lineage")
+    def sql_lineage_by_pipeline(name: str):
+        rows = get_by_pipeline(name)
+        latest: dict[str, dict] = {}
+        for r in rows:
+            step = r.get("step")
+            cur = latest.get(step)
+            if (not cur) or r.get("ts", 0) > cur.get("ts", 0):
+                latest[step] = r
+        summary = []
+        for step, r in latest.items():
+            p = r.get("parsed", {})
+            summary.append({
+                "step": step,
+                "dst": p.get("dst"),
+                "sources": p.get("sources", []),
+                "columns": p.get("columns", []),
+                "file": r.get("file"),
+                "ts": r.get("ts"),
+            })
+        return {"ok": True, "pipeline": name, "steps": summary}
+
+# -----------------------------------------------------------------------------#
+# 8) 레포 없이 바로 체험: Inline SQL 파싱 저장
+# -----------------------------------------------------------------------------#
+class InlineSqlReq(BaseModel):
+    pipeline: str
+    sql: str | None = None
+    sql_list: List[str] | None = None
+    job_id: str | None = None
+    dialect: str | None = None
+
+@app.post("/tasks/sql/inline", summary="Parse & Store Inline SQL (no repo needed)")
+def task_sql_inline(req: InlineSqlReq):
+    payload: List[str] = []
+    if req.sql:
+        payload.append(req.sql)
+    if req.sql_list:
+        payload.extend(req.sql_list)
+    if not payload:
+        raise HTTPException(status_code=400, detail="sql or sql_list required")
+
+    saved = 0
+    for i, sql in enumerate(payload, start=1):
+        parsed = try_parse(sql, dialect=req.dialect)
+        if not parsed.get("ok"):
+            continue
+        put({
+            "pipeline": req.pipeline,
+            "job_id": req.job_id,
+            "step": f"inline::{i}",
+            "file": f"inline::{i}",
+            "sql": sql,
+            "parsed": parsed
+        })
+        saved += 1
+    return {"ok": True, "saved": saved, "pipeline": req.pipeline}
+
+# -----------------------------------------------------------------------------#
 # Entrypoint
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 if __name__ == "__main__":
-    # 개발 기본 포트 8300 (로그 일관)
     uvicorn.run(app, host="0.0.0.0", port=8300)
