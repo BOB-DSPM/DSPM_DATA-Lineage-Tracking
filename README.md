@@ -1,22 +1,26 @@
-# SageMaker Lineage API (FastAPI + boto3)
+# SageMaker Lineage API — **v1.4.0**
 
-**SageMaker 파이프라인의 데이터 라인리지(노드/엣지/아티팩트)와 실행 상태**를 JSON으로 제공하는 API로,  
-핵심 로직은 `lineage.py`의 `get_lineage_json()`이며, HTTP 레이어는 `api.py`가 담당한다.
+**SageMaker 파이프라인의 데이터 라인리지(노드/엣지/아티팩트) + 실행상태 + 데이터스키마(Parquet/JSON/CSV) + Feature Store 메타**를
+JSON으로 제공하는 경량 API입니다. HTTP 레이어는 `api.py`, 핵심 로직은 `lineage.py`이며, 데이터 스키마/증거 모듈은 `modules/*`에 있습니다.
 
-> v1.3.0 기준 문서 — 신규 엔드포인트 **`/sagemaker/overview`** 추가(리전별 Domain + Pipeline 일괄 조회).
+> v1.3.0 문서를 기반으로 기능을 확장했습니다. (기존 문서 참고 사항은 그대로 유효)  
+> **신규/변경 사항 요약**: `pyarrow` 기반 Parquet 스키마 추출, S3 경로 스키마 버저닝, SQL 가벼운 라인리지, SageMaker Feature Group 메타, 파이프라인 카탈로그 확장 등.
 
 ---
 
-## ✨ 제공 기능
+## ✨ 주요 기능 (v1.4.0 기준)
 
-- SageMaker 파이프라인 **정의**를 읽어 **그래프**(nodes / edges / artifacts) 구성
-- 최신 실행(최근 1건) 기준으로 **상태/시간/메트릭/입출력/레지스트리** 보강 (옵션)
-- Evaluate 스텝 산출(`report.json`/`evaluation.json`/`metrics.json`)에서 **평가 지표** 추가 시도 (옵션)
-- S3 버킷 **보안 메타** 수집: Region / 암호화 / 버저닝 / Public Access / 태그
-- **헬스체크** 엔드포인트
-- **카탈로그**: Region → Domain → Pipeline 구조로 조회
-- **도메인 단위 일괄 라인리지** 및 **단일 파이프라인 라인리지** 조회
-- **리전 개요**: 다수 리전을 한 번에 스캔해 `region → {domains[], pipelines[]}`로 반환
+- SageMaker 파이프라인 **정의 → 그래프(nodes/edges/artifacts)** 구성
+- 최신 실행(최근 1건) 기준 **상태/시간/메트릭/입출력/레지스트리** 보강 (`includeLatestExec=true`)
+- **뷰 전환**: `view=pipeline | data | both` (파이프라인 의존 흐름 vs 데이터 중심 흐름)
+- **데이터 스키마 수집**
+  - **Parquet**: `pyarrow`로 **원격 S3에서 메타 스키마 추출** (정확)
+  - **JSON/CSV**: Head 샘플링으로 타입 추정
+  - **스키마 버저닝**: `modules/schema_store.py` — `dataset_id`, `policyHash`, `version` 기반 보관/조회
+- **Feature Store**: SageMaker **Feature Group** 메타 조회/목록화
+- **SQL 라이트 라인리지**: `INSERT..SELECT`/`CTAS`의 간단한 **src↔dst 컬럼 매핑** 추출
+- **리전 카탈로그**: Region → Pipelines(+최신 실행 요약)
+- **헬스체크**: `/health`
 
 ---
 
@@ -24,130 +28,47 @@
 
 ```
 .
-├─ api.py            # FastAPI 엔드포인트 (/health, /sagemaker/overview, /sagemaker/catalog, /lineage, /lineage/by-domain)
-├─ lineage.py        # boto3 로직 + get_lineage_json(), 인벤토리 유틸
-└─ requirements.txt  # 필요한 파이썬 라이브러리 목록
+├─ api.py                     # FastAPI 엔드포인트들
+├─ lineage.py                 # 그래프 생성/보강, S3 메타, Evaluate 보고서 메트릭 수집
+├─ modules/
+│  ├─ parquet_probe.py        # pyarrow 기반 Parquet 스키마 추출
+│  ├─ schema_sampler.py       # S3 JSON/CSV 샘플링 + Parquet 경로 위임
+│  ├─ schema_store.py         # 스키마 버저닝 저장/조회(JSONL)
+│  ├─ featurestore_schema.py  # SageMaker Feature Group 메타
+│  └─ sql_lineage_light.py    # 단순 SQL 라인리지 추출
+├─ requirements.txt           # fastapi, boto3, pyarrow 포함
+├─ dockerfile                 # 컨테이너 실행(기본 포트 8300)
+└─ README.md
 ```
 
 ---
 
-## 🔌 전체 동작 흐름
+## 🌐 API 엔드포인트
 
-1. 페이지 초기 로딩 시 `GET /sagemaker/overview?includeLatestExec=true` 호출 → **리전별 Domain + Pipeline**을 한 번에 수신
-2. 프론트에서 지역/도메인/파이프라인을 **필터링만** 수행(재호출 없음)
-3. 사용자가 특정 파이프라인을 선택하면 `GET /lineage` 호출로 상세 그래프/요약 조회
-4. 필요 시 도메인 단위로 `GET /lineage/by-domain` 호출(해당 도메인의 모든 파이프라인 일괄)
+### 0) 상태
+`GET /health` → `{ "status":"ok", "version":"1.4.0" }`
 
-> 기존 방식(`/sagemaker/catalog`)도 유지되며, 특정 리전만 빠르게 보고 싶을 때 유용함.
+### 1) 파이프라인 카탈로그 (확장)
+`GET /sagemaker/pipelines`
+- `regions` (선택, 쉼표구분) — 예: `ap-northeast-2,us-east-1`
+- `domainName` (선택) / `domainId` (선택) — 파이프라인 태그/매칭으로 필터
+- `includeLatestExec` (선택, 기본 false) — 최신 실행 1건 요약 포함
+- `profile` (선택, 개발용)
 
-반환 스키마(요약, `/lineage`):
-```jsonc
-{
-  "domain": {...},          // 선택: DomainName 태그 필터 사용 시
-  "pipeline": { "name": "...", "arn": "...", "lastModifiedTime": "..." },
-  "summary": {
-    "overallStatus": "Succeeded|Executing|Failed|Unknown",
-    "nodeStatus": { "Succeeded": n, "Failed": m, ... },
-    "elapsedSec": 1234
-  },
-  "graph": {
-    "nodes": [ { "id": "...", "type": "...", "inputs": [...], "outputs": [...], "run": {...} } ],
-    "edges": [ { "from": "...", "to": "...", "via": "dependsOn|ref:Get", "label": "..." } ],
-    "artifacts": [ { "id": 0, "uri": "s3://.../...", "bucket": "...", "key": "...", "s3": {...} } ]
-  }
-}
-```
-
----
-
-## ▶️ 로컬 실행 (테스트용)
-
-### 0) 요구 사항
-- Python 3.10+
-- AWS 자격증명(개발 시 `aws configure --profile <name>`)
-
-### 1) 가상환경 (권장)
-```bash
-python -m venv .venv
-# Windows
-.\.venv\Scriptsctivate
-# macOS / Linux
-source .venv/bin/activate
-```
-
-### 2) 의존성 설치
-```bash
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-# requirements가 없다면: fastapi uvicorn boto3 botocore 설치
-```
-
-### 3) 서버 실행
-```bash
-# 모듈 실행(핫리로드)
-python -m uvicorn api:app --reload --port 8000
-
-# 또는 파일 실행
-python api.py
-```
-
-### 4) 빠른 테스트
-```bash
-# 헬스체크
-curl "http://localhost:8000/health"
-
-# (예) 리전 개요: 다수 리전 스캔 + 최신 실행 포함
-curl "http://localhost:8000/sagemaker/overview?includeLatestExec=true&regions=ap-northeast-2"
-
-# (예) 카탈로그: 특정 리전만
-curl "http://localhost:8000/sagemaker/catalog?regions=ap-northeast-2"
-
-# (예) 도메인 단위 일괄 라인리지
-curl "http://localhost:8000/lineage/by-domain?region=ap-northeast-2&domain=<DOMAIN_NAME>&includeLatestExec=true"
-
-# (예) 단일 파이프라인 라인리지
-curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAME>&domain=<DOMAIN_NAME>&includeLatestExec=true"
-```
-
-> 개발 중 로컬 AWS 프로필을 사용하려면 쿼리스트링에 `&profile=dev` 추가 또는 환경변수 `AWS_PROFILE=dev`로 지정.  
-> 운영 배포에서는 프로필 파라미터 제거 + **IAM Role** 사용 권장.
-
----
-
-## 🌐 API 사양
-
-### `GET /health`
-상태 및 버전 확인.
-```json
-{ "status": "ok", "version": "1.3.0" }
-```
-
-### `GET /sagemaker/overview`
-- 설명: 여러 리전을 한 번에 스캔하여 `region → {domains[], pipelines[]}` 구조 반환
-- 쿼리:
-  - `regions` (선택) — 쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도
-  - `includeLatestExec` (선택, 기본 `false`) — 파이프라인별 최신 실행 1건 요약 포함
-  - `profile` (선택, 개발용) — 로컬 AWS 프로필명(운영 미사용/무시 권장)
-- 응답 예시:
+응답 예:
 ```json
 {
   "regions": [
     {
       "region": "ap-northeast-2",
-      "domains": [
-        {"domainId":"d-xxxx","domainArn":"...","domainName":"team-dev","status":"InService"}
-      ],
       "pipelines": [
         {
-          "pipelineName":"mlops-pipeline",
-          "pipelineArn":"...",
-          "created":"2025-10-05T03:12:00Z",
-          "latestExecution": {
-            "status":"Succeeded",
-            "arn":"...",
-            "startTime":"2025-10-05T03:13:00Z",
-            "lastModifiedTime":"2025-10-05T03:25:10Z"
-          }
+          "name": "mlops-pipeline",
+          "arn": "arn:aws:sagemaker:...:pipeline/mlops-pipeline",
+          "created": "2025-10-05T03:12:00Z",
+          "tags": {"DomainName":"studio-a"},
+          "matchedDomain": {"DomainName":"studio-a","DomainId":"d-xxxx"},
+          "latestExecution": {"status":"Succeeded","arn":"...", "startTime":"...", "lastModifiedTime":"..."}
         }
       ]
     }
@@ -155,140 +76,192 @@ curl "http://localhost:8000/lineage?region=ap-northeast-2&pipeline=<PIPELINE_NAM
 }
 ```
 
-### `GET /sagemaker/catalog`
-리전별 도메인/파이프라인 카탈로그(기존).
-- 쿼리:  
-  - `regions` (선택) — 쉼표구분 리전 목록. 미지정 시 SageMaker 지원 리전 전체 시도  
-  - `profile` (선택, 개발용) — 로컬 AWS 프로필명
+> 기존 `/sagemaker/overview`, `/sagemaker/catalog`도 계속 제공됩니다.
 
-### `GET /lineage`
-단일 파이프라인 라인리지 조회.
-- 쿼리:  
-  - `pipeline` (필수) — 파이프라인 이름  
-  - `region` (필수) — 예: `ap-northeast-2`  
-  - `domain` (선택) — DomainName 태그 필터  
-  - `includeLatestExec` (선택) — `true`면 최신 실행 정보 보강  
-  - `profile` (선택, 개발용) — 로컬 AWS 프로필명
+### 2) 라인리지 조회 (기존 + view 확장)
+`GET /lineage`
+- `region` (필수), `pipeline` (필수), `domain` (선택), `includeLatestExec` (선택)
+- **`view` (선택)**: `pipeline | data | both` (기본 both)
 
-### `GET /lineage/by-domain`
-도메인에 매칭된 모든 파이프라인 라인리지를 일괄 반환.
-- 쿼리:  
-  - `region` (필수) — 리전  
-  - `domain` (필수) — DomainName  
-  - `includeLatestExec` (선택) — 최신 실행 포함 여부  
-  - `profile` (선택, 개발용) — 로컬 프로필명
-- 응답:
-```jsonc
+`GET /lineage/by-domain`
+- 도메인에 속한 모든 파이프라인 라인리지를 일괄 반환
+- `region` (필수), `domain` (필수), `includeLatestExec` (선택)
+
+### 3) 데이터 스키마 — 샘플 & 버전
+- **샘플/저장**: `GET /datasets/{{bucket}}/{{prefix}}/schema?region=ap-northeast-2&save=true&policy={{json}}`
+  - Parquet이면 `pyarrow`로 메타 추출, JSON/CSV는 샘플링
+  - `save=true` + `policy`(任意 JSON) 시 `schema_store`에 버전 기록
+- **버전 목록**: `GET /datasets/{{bucket}}/{{prefix}}/schema/versions?region=...`
+  - 최신 순 정렬, `version`/`createdAt`/`policyHash`/`fields` 제공
+
+응답 예(샘플):
+```json
 {
-  "region": "ap-northeast-2",
-  "domain": "studio-a",
-  "count": 2,
-  "results": [
-    { "pipeline": "mlops-a", "ok": true,  "data": { /* lineage JSON */ } },
-    { "pipeline": "mlops-b", "ok": false, "error": "권한/리소스 오류 등" }
-  ]
+  "ok": true,
+  "dataset_id": "s3://my-bucket/path/to/data/",
+  "schema": {
+    "format": "parquet",
+    "fields": {"user_id":"int64","ts":"timestamp[us, tz=UTC]","score":"double"},
+    "sampled_files": ["s3://my-bucket/path/to/data/part-0000.parquet"],
+    "meta": {"num_row_groups": 4}
+  },
+  "saved": {"version": 3, "policyHash": "a1b2c3d4e5f6...."}  // save=true인 경우
 }
+```
+
+### 4) SageMaker Feature Store
+- **목록**: `GET /featurestore/feature-groups?region=ap-northeast-2`
+- **상세**: `GET /featurestore/feature-groups/{{name}}?region=ap-northeast-2`
+  - 반환: features(컬럼 정의/타입), offline/online store 설정, KMS, 생성시각, 상태 등
+
+---
+
+## ▶️ 로컬 실행
+
+```bash
+python -m venv .venv
+source .venv/bin/activate            # Windows: .\.venv\Scripts\activate
+pip install -U pip
+pip install -r requirements.txt
+
+# 개발용 서버 실행(기본 8300)
+uvicorn api:app --reload --port 8300
+# 또는
+python api.py
+```
+
+### 빠른 호출 예시
+```bash
+# 헬스체크
+curl "http://localhost:8300/health"
+
+# 파이프라인 카탈로그(리전 지정 + 최신 실행 포함)
+curl "http://localhost:8300/sagemaker/pipelines?regions=ap-northeast-2&includeLatestExec=true"
+
+# 단일 파이프라인 라인리지(데이터 중심 보기)
+curl "http://localhost:8300/lineage?region=ap-northeast-2&pipeline=mlops-pipeline&view=data&includeLatestExec=true"
+
+# 도메인 단위 일괄 라인리지
+curl "http://localhost:8300/lineage/by-domain?region=ap-northeast-2&domain=studio-a&includeLatestExec=true"
+
+# S3 경로 스키마 샘플링(+저장)
+curl "http://localhost:8300/datasets/my-bucket/path/to/prefix/schema?region=ap-northeast-2&save=true"
+
+# 스키마 버전 목록
+curl "http://localhost:8300/datasets/my-bucket/path/to/prefix/schema/versions?region=ap-northeast-2"
+
+# Feature Group 목록/상세
+curl "http://localhost:8300/featurestore/feature-groups?region=ap-northeast-2"
+curl "http://localhost:8300/featurestore/feature-groups/user_profiles?region=ap-northeast-2"
+```
+
+> 로컬 자격증명 사용: `AWS_PROFILE=dev` 환경변수 또는 쿼리스트링 `&profile=dev`  
+> 운영 배포: 인스턴스 프로파일/IRSA 등 **Role 기반** 권장
+
+---
+
+## 🔐 최소 권한(IAM)
+
+- SageMaker: `ListPipelines`, `GetPipeline`, `ListPipelineExecutions`, `DescribePipelineDefinitionForExecution`, `ListPipelineExecutionSteps`, `Describe*Job`, `ListTags`
+- S3: `GetBucketLocation`, `GetBucketEncryption`, `GetBucketVersioning`, `GetPublicAccessBlock`, `GetBucketTagging`, `GetObject`(평가리포트/샘플용)
+- (Feature Store 사용 시) `sagemaker:DescribeFeatureGroup`, `sagemaker:ListFeatureGroups`
+
+리소스 범위는 **특정 파이프라인/버킷으로 제한**하는 것을 추천합니다.
+
+---
+
+## 🧑‍💻 프론트엔드 연동 가이드 (간단 ver.)
+
+### 1) 데이터 소스 로딩
+```ts
+// 초기 1회: 카탈로그
+const catalog = await fetch(`/sagemaker/pipelines?regions=ap-northeast-2&includeLatestExec=true`).then(r=>r.json());
+
+// 사용자 선택에 따라
+const region   = "ap-northeast-2";
+const pipeline = "mlops-pipeline";
+const domain   = "studio-a";
+
+// 라인리지(뷰 전환 지원)
+const lineage = await fetch(`/lineage?region=${region}&pipeline=${pipeline}&domain=${domain}&view=both&includeLatestExec=true`).then(r=>r.json());
+
+// 데이터 스키마
+const sch = await fetch(`/datasets/my-bucket/path/to/prefix/schema?region=${region}`).then(r=>r.json());
+
+// Feature Group
+const fgs = await fetch(`/featurestore/feature-groups?region=${region}`).then(r=>r.json());
+```
+
+### 2) 간단 UI 구성 제안
+- **좌측 패널**: Region / Domain / Pipeline 선택 드롭다운 + 검색
+- **상단 탭**: `Pipeline` | `Data` | `Both`
+  - *Pipeline*: DAG(노드/엣지) + **스텝 상태 칩**(Succeeded/Failed/Executing) + 경과시간
+  - *Data*: **Artifacts 리스트**(S3 URI) + 각 항목 클릭 시 **스키마 패널** 열기
+  - *Both*: DAG와 아티팩트를 좌/우 Split로 동시 표시
+- **우측 상세 패널** (선택 시 표시)
+  - 노드: 입력/출력 URI, 실행시간, 상태, (있으면) **메트릭(JSON)** 미니 테이블
+  - 아티팩트: S3 메타(Region/암호화/버저닝/PublicAccess), **스키마 필드/타입**, 샘플 파일 목록
+- **부가**: Feature Group 탭(목록 → 선택 시 컬럼/스토어 설정 표시), 스키마 **버전 드롭다운**
+
+> 그래프는 React Flow / Cytoscape.js, 테이블은 shadcn/ui + Tailwind 조합을 권장합니다.
+
+---
+
+## 🧩 코드 변화 포인트 (추가된 모듈/엔드포인트 설명)
+
+- `modules/parquet_probe.py`
+  - `pyarrow` + `S3FileSystem`으로 **원격 S3의 Parquet 메타 스키마**를 정확히 추출합니다.
+- `modules/schema_sampler.py`
+  - S3 프리픽스에서 **최대 N개 오브젝트**를 샘플링하고, 포맷별(JSON/CSV/Parquet) 스키마를 **머지**합니다.
+- `modules/schema_store.py`
+  - `dataset_id`(s3://bucket/prefix), `policy`(任意 JSON) → `policyHash` 기반 **버저닝 저장/조회**.
+- `modules/sql_lineage_light.py`
+  - `INSERT .. SELECT` / `CREATE TABLE AS SELECT` 구문에서 **src/dst/cols**를 가볍게 추출(실서비스는 `sqlglot` 권장).
+- `modules/featurestore_schema.py`
+  - Feature Group **목록/상세** API용 래퍼.
+- `api.py` (핵심 라우트 추가)
+  - `GET /sagemaker/pipelines`
+  - `GET /datasets/{{bucket}}/{{prefix}}/schema`
+  - `GET /datasets/{{bucket}}/{{prefix}}/schema/versions`
+  - `GET /featurestore/feature-groups`, `GET /featurestore/feature-groups/{name}`
+  - `GET /lineage`의 `view` 파라미터 지원
+
+---
+
+## 🐳 Docker 실행 예시
+
+```bash
+docker build -t lineage-api:1.4 .
+docker run --rm -p 8300:8300 -e AWS_PROFILE=default -v ~/.aws:/root/.aws:ro lineage-api:1.4
+# 헬스체크
+curl http://localhost:8300/health
 ```
 
 ---
 
-## 🔐 최소 권한(IAM 예시)
+## ⚠️ 운영 팁
 
-조회 권한 위주로 구성하세요(버킷/리소스 ARN은 환경에 맞게 제한 권장).
+- **리전 제한**: 대규모 계정은 `ALLOWED_REGIONS`(환경변수)로 제한하고, 프론트는 **필터링만** 수행
+- **캐시**: 파이프라인/카탈로그 응답은 프런트에서 30~60초 정도 캐싱
+- **보안**: CORS/최소권한/IAM Role/CloudWatch Logs/헬스체크 설정 권장
+- **PyArrow**: Lambda 컨테이너 등에서는 **플랫폼 빌드** 주의(이미지 기반 배포 권장)
+
+---
+
+## 📎 샘플 응답 스니펫 (라인리지 요약)
 
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "sagemaker:ListPipelines",
-        "sagemaker:GetPipeline",
-        "sagemaker:ListPipelineExecutions",
-        "sagemaker:DescribePipelineDefinitionForExecution",
-        "sagemaker:ListPipelineExecutionSteps",
-        "sagemaker:DescribeProcessingJob",
-        "sagemaker:DescribeTrainingJob",
-        "sagemaker:ListTags"
-      ],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "s3:GetBucketLocation",
-        "s3:GetBucketEncryption",
-        "s3:GetBucketVersioning",
-        "s3:GetPublicAccessBlock",
-        "s3:GetBucketTagging"
-      ],
-      "Resource": "arn:aws:s3:::*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::<EVAL_REPORT_BUCKET>/*"
-    }
-  ]
+  "pipeline": {"name":"mlops-pipeline","arn":"...","lastModifiedTime":"..."},
+  "summary": {
+    "overallStatus":"Succeeded",
+    "nodeStatus":{"Succeeded":12,"Failed":0,"Executing":0},
+    "elapsedSec": 1234
+  },
+  "graph": {
+    "nodes":[{"id":"Preprocess","type":"Processing","inputs":[...],"outputs":[...],"run":{"status":"Succeeded"}}],
+    "edges":[{"from":"Preprocess","to":"Train","via":"dependsOn"}],
+    "artifacts":[{"id":0,"uri":"s3://bucket/path/part-0000.parquet","s3":{"region":"ap-northeast-2","encryption":"AES256"}}]
+  }
 }
 ```
-
----
-
-## ⚙️ 환경변수 (운영 팁)
-
-- `ALLOWED_REGIONS="ap-northeast-2,us-east-1"` — 스캔/허용 리전 제한
-- `OVERVIEW_TTL_SECONDS="60"` — `/sagemaker/overview` 결과 캐시 TTL(초). `0`이면 비활성
-- (컨테이너 사용 시) `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION` 또는 `-v ~/.aws:/root/.aws:ro` + `AWS_PROFILE`
-
----
-
-## 🧑‍💻 프론트엔드 연동 예시
-
-```js
-// 1) 개요로 트리 로드(초기 1회)
-const overview = await fetch("/sagemaker/overview?includeLatestExec=true").then(r => r.json());
-
-// 2) 사용자가 Region/Domain/Pipeline 선택 (필터는 프론트에서만)
-const region = "ap-northeast-2";
-const pipeline = "mlops-pipe";
-
-// 3) 단일 파이프라인 라인리지
-const oneRes = await fetch(`/lineage?region=${region}&pipeline=${pipeline}&includeLatestExec=true`).then(r => r.json());
-
-// 4) 도메인 전체 라인리지
-const domain = "studio-a";
-const allRes = await fetch(`/lineage/by-domain?region=${region}&domain=${domain}&includeLatestExec=true`).then(r => r.json());
-```
-
-> 브라우저 CORS 에러가 발생하면 `api.py`의 CORS 설정에서 `allow_origins`에 프론트 도메인을 명시할 수 있으며, 현재 템플릿은 `*`로 열려 있음.
-
----
-
-## 🐳 Docker (선택)
-
-**Dockerfile 예시**
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY api.py lineage.py requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-EXPOSE 8000
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-빌드/실행:
-```bash
-docker build -t lineage-api .
-docker run --rm -p 8000:8000 lineage-api
-# (로컬 자격증명 사용 시) -v ~/.aws:/root/.aws:ro -e AWS_PROFILE=default 추가
-```
-
----
-
-## ⚠️ 주의 & 팁
-
-- 대규모 계정/리전에서 전 리전 스캔은 느릴 수 있으므로 운영에서는 `ALLOWED_REGIONS`로 제한하고, `/sagemaker/overview` 캐시(`OVERVIEW_TTL_SECONDS`)를 권장함.
-- Evaluate 리포트 탐색 규칙은 `Evaluate` 스텝의 `report` 출력 경로에서 파일명을 **우선 탐색**하고, 명명 규칙이 다르면 코드에서 조건을 맞춰야 함.
-- 프로덕션에서는 CORS 제한, 최소 권한, 모니터링/로깅, 헬스체크(현재 `/health`) 설정을 권장함.
