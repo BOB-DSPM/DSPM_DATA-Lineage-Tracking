@@ -1,267 +1,212 @@
-# SageMaker Lineage API — **v1.4.0**
+# SageMaker Lineage API — **v1.5.0**
 
-**SageMaker 파이프라인의 데이터 라인리지(노드/엣지/아티팩트) + 실행상태 + 데이터스키마(Parquet/JSON/CSV) + Feature Store 메타**를
-JSON으로 제공하는 경량 API입니다. HTTP 레이어는 `api.py`, 핵심 로직은 `lineage.py`이며, 데이터 스키마/증거 모듈은 `modules/*`에 있습니다.
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green)](https://fastapi.tiangolo.com/)
+[![AWS](https://img.shields.io/badge/AWS-SageMaker-orange)](https://aws.amazon.com/sagemaker/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> v1.3.0 문서를 기반으로 기능을 확장했습니다. (기존 문서 참고 사항은 그대로 유효)  
-> **신규/변경 사항 요약**: `pyarrow` 기반 Parquet 스키마 추출, S3 경로 스키마 버저닝, SQL 가벼운 라인리지, SageMaker Feature Group 메타, 파이프라인 카탈로그 확장 등.
+## 📘 프로젝트 개요
+
+**DSPM_DATA-Lineage-Tracking**은 AWS **SageMaker 파이프라인의 데이터 라인리지(Data Lineage)** 를 자동 추출하고,  
+각 Step의 **실행 상태, 입출력, S3 스키마, Feature Store 메타데이터, SQL 매핑** 등을 통합 관리하는 경량형 API 서버입니다.
+
+FastAPI를 기반으로 구현되었으며, MLOps 파이프라인의 데이터 흐름을 **시각적으로 추적**하고 **데이터 거버넌스**를 강화하기 위해 설계되었습니다.
 
 ---
 
-## ✨ 주요 기능 (v1.4.0 기준)
+## ⚙️ 주요 기능
 
-- SageMaker 파이프라인 **정의 → 그래프(nodes/edges/artifacts)** 구성
-- 최신 실행(최근 1건) 기준 **상태/시간/메트릭/입출력/레지스트리** 보강 (`includeLatestExec=true`)
-- **뷰 전환**: `view=pipeline | data | both` (파이프라인 의존 흐름 vs 데이터 중심 흐름)
-- **데이터 스키마 수집**
-  - **Parquet**: `pyarrow`로 **원격 S3에서 메타 스키마 추출** (정확)
-  - **JSON/CSV**: Head 샘플링으로 타입 추정
-  - **스키마 버저닝**: `modules/schema_store.py` — `dataset_id`, `policyHash`, `version` 기반 보관/조회
-- **Feature Store**: SageMaker **Feature Group** 메타 조회/목록화
-- **SQL 라이트 라인리지**: `INSERT..SELECT`/`CTAS`의 간단한 **src↔dst 컬럼 매핑** 추출
-- **리전 카탈로그**: Region → Pipelines(+최신 실행 요약)
-- **헬스체크**: `/health`
+| 기능 구분 | 설명 |
+|------------|------|
+| **SQL 기반 라인리지 추출** | `CREATE TABLE AS SELECT`, `INSERT INTO SELECT` 구문 분석하여 Input→Output 테이블 및 컬럼 매핑 자동화 |
+| **AWS SageMaker 파이프라인 분석** | 각 Step의 입력/출력, 최신 실행(Job) 메타데이터, 지표, 레지스트리 정보를 통합 라인리지 그래프로 구성 |
+| **데이터 라인리지 시각화용 그래프 변환** | `graphPipeline`, `graphData` 노드·엣지 구조 생성 (DAG 기반) |
+| **데이터셋 스키마 버전 관리** | `schema_store.py`를 통해 버전별 스키마 및 정책 관리(JSONL append 방식) |
+| **S3 데이터 스키마 자동 샘플링** | JSON/CSV/Parquet 포맷 자동 감지 및 `pyarrow`, `boto3` 기반 스키마 추출 |
+| **Git 연동 지원** | Git 저장소 내 SQL 자동 pull/fetch 후 최신 버전 기반 분석 가능 |
+| **FastAPI 기반 REST 서비스화** | `/lineage`, `/datasets/schema`, `/sql/lineage` 등 REST API 제공 |
+| **Inline SQL 체험 지원** | `/tasks/sql/inline` 엔드포인트를 통해 SQL 직접 입력·저장 후 라인리지 생성 |
 
 ---
 
 ## 🧱 디렉터리 구조
 
 ```
-.
-├─ api.py                     # FastAPI 엔드포인트들
-├─ lineage.py                 # 그래프 생성/보강, S3 메타, Evaluate 보고서 메트릭 수집
+DSPM_DATA-Lineage-Tracking/
+├─ api.py                     # FastAPI 엔드포인트
+├─ lineage.py                 # SageMaker 파이프라인 라인리지 생성/보강
 ├─ modules/
 │  ├─ parquet_probe.py        # pyarrow 기반 Parquet 스키마 추출
-│  ├─ schema_sampler.py       # S3 JSON/CSV 샘플링 + Parquet 경로 위임
+│  ├─ schema_sampler.py       # JSON/CSV 샘플링 + Parquet 위임
 │  ├─ schema_store.py         # 스키마 버저닝 저장/조회(JSONL)
-│  ├─ featurestore_schema.py  # SageMaker Feature Group 메타
-│  └─ sql_lineage_light.py    # 단순 SQL 라인리지 추출
-├─ requirements.txt           # fastapi, boto3, pyarrow 포함
-├─ dockerfile                 # 컨테이너 실행(기본 포트 8300)
+│  ├─ featurestore_schema.py  # Feature Store 메타데이터
+│  ├─ sql_lineage_light.py    # SQL 라이트 라인리지 추출
+│  ├─ sql_lineage_store.py    # SQL 파싱 결과 저장
+│  ├─ sql_collector.py        # SQL 수집 모듈
+│  └─ connectors/git_fetch.py # Git 기반 SQL 동기화
+├─ demo_repo/models/          # 테스트용 SQL 예시 파일
+├─ dockerfile                 # 컨테이너 빌드 파일
+├─ requirements.txt           # 종속성 목록
 └─ README.md
 ```
 
 ---
 
-## 🌐 API 엔드포인트
+## 🚀 Local Execution (로컬 실행 방법)
 
-### 0) 상태
-`GET /health` → `{ "status":"ok", "version":"1.4.0" }`
+### 1️⃣ 환경 구성
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-### 1) 파이프라인 카탈로그 (확장)
-`GET /sagemaker/pipelines`
-- `regions` (선택, 쉼표구분) — 예: `ap-northeast-2,us-east-1`
-- `domainName` (선택) / `domainId` (선택) — 파이프라인 태그/매칭으로 필터
-- `includeLatestExec` (선택, 기본 false) — 최신 실행 1건 요약 포함
-- `profile` (선택, 개발용)
+### 2️⃣ 로컬 서버 실행
+```bash
+uvicorn api:app --reload --host 0.0.0.0 --port 8300
+```
 
-응답 예:
+브라우저에서 `http://localhost:8300/docs` 접속 → Swagger UI에서 테스트 가능.
+
+### 3️⃣ 테스트 요청 예시
+```bash
+# 파이프라인 라인리지 조회
+curl "http://localhost:8300/lineage?pipeline=MyPipe&region=ap-northeast-2&includeLatestExec=true&view=both"
+
+# 데이터셋 스키마 스캔
+curl -X POST "http://localhost:8300/datasets/schema/scan?region=ap-northeast-2&s3_uri=s3://my-bucket/data"
+
+# Inline SQL 파싱 저장
+curl -X POST -H "Content-Type: application/json"   -d '{"pipeline": "demo", "sql": "CREATE TABLE a AS SELECT x,y FROM b;"}'   http://localhost:8300/tasks/sql/inline
+```
+
+---
+
+## 🌐 주요 API 엔드포인트
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | 서버 상태 확인 |
+| GET | `/sagemaker/pipelines` | SageMaker 파이프라인 목록 조회 및 도메인 매핑 |
+| GET | `/lineage` | 특정 파이프라인의 라인리지(그래프 포함) |
+| GET | `/lineage/by-domain` | 도메인 내 모든 파이프라인 라인리지 조회 |
+| POST | `/datasets/schema/scan` | S3 샘플 데이터를 기반으로 스키마 추출 및 저장 |
+| GET | `/datasets/{bucket}/{prefix}/schema` | 데이터셋 최신/특정 버전 스키마 조회 |
+| GET | `/datasets/{bucket}/{prefix}/schema/versions` | 스키마 버전 목록 조회 |
+| POST | `/sql/lineage` | SQL 구문 파싱(Lineage 추출) |
+| POST | `/tasks/sql/inline` | SQL 직접 입력/파싱 후 저장 (체험용) |
+
+---
+
+## 🔒 최소 IAM 권한
+
 ```json
 {
-  "regions": [
+  "Version": "2012-10-17",
+  "Statement": [
     {
-      "region": "ap-northeast-2",
-      "pipelines": [
-        {
-          "name": "mlops-pipeline",
-          "arn": "arn:aws:sagemaker:...:pipeline/mlops-pipeline",
-          "created": "2025-10-05T03:12:00Z",
-          "tags": {"DomainName":"studio-a"},
-          "matchedDomain": {"DomainName":"studio-a","DomainId":"d-xxxx"},
-          "latestExecution": {"status":"Succeeded","arn":"...", "startTime":"...", "lastModifiedTime":"..."}
-        }
-      ]
+      "Effect": "Allow",
+      "Action": [
+        "sagemaker:ListPipelines",
+        "sagemaker:DescribePipeline",
+        "sagemaker:ListPipelineExecutionSteps",
+        "sagemaker:ListPipelineExecutions",
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": "*"
     }
   ]
 }
 ```
 
-> 기존 `/sagemaker/overview`, `/sagemaker/catalog`도 계속 제공됩니다.
+---
 
-### 2) 라인리지 조회 (기존 + view 확장)
-`GET /lineage`
-- `region` (필수), `pipeline` (필수), `domain` (선택), `includeLatestExec` (선택)
-- **`view` (선택)**: `pipeline | data | both` (기본 both)
+## 🔁 데이터 처리 흐름
 
-`GET /lineage/by-domain`
-- 도메인에 속한 모든 파이프라인 라인리지를 일괄 반환
-- `region` (필수), `domain` (필수), `includeLatestExec` (선택)
-
-### 3) 데이터 스키마 — 샘플 & 버전
-- **샘플/저장**: `GET /datasets/{{bucket}}/{{prefix}}/schema?region=ap-northeast-2&save=true&policy={{json}}`
-  - Parquet이면 `pyarrow`로 메타 추출, JSON/CSV는 샘플링
-  - `save=true` + `policy`(任意 JSON) 시 `schema_store`에 버전 기록
-- **버전 목록**: `GET /datasets/{{bucket}}/{{prefix}}/schema/versions?region=...`
-  - 최신 순 정렬, `version`/`createdAt`/`policyHash`/`fields` 제공
-
-응답 예(샘플):
-```json
-{
-  "ok": true,
-  "dataset_id": "s3://my-bucket/path/to/data/",
-  "schema": {
-    "format": "parquet",
-    "fields": {"user_id":"int64","ts":"timestamp[us, tz=UTC]","score":"double"},
-    "sampled_files": ["s3://my-bucket/path/to/data/part-0000.parquet"],
-    "meta": {"num_row_groups": 4}
-  },
-  "saved": {"version": 3, "policyHash": "a1b2c3d4e5f6...."}  // save=true인 경우
-}
 ```
-
-### 4) SageMaker Feature Store
-- **목록**: `GET /featurestore/feature-groups?region=ap-northeast-2`
-- **상세**: `GET /featurestore/feature-groups/{{name}}?region=ap-northeast-2`
-  - 반환: features(컬럼 정의/타입), offline/online store 설정, KMS, 생성시각, 상태 등
-
----
-
-## ▶️ 로컬 실행
-
-```bash
-python -m venv .venv
-source .venv/bin/activate            # Windows: .\.venv\Scripts\activate
-pip install -U pip
-pip install -r requirements.txt
-
-# 개발용 서버 실행(기본 8300)
-uvicorn api:app --reload --port 8300
-# 또는
-python api.py
-```
-
-### 빠른 호출 예시
-```bash
-# 헬스체크
-curl "http://localhost:8300/health"
-
-# 파이프라인 카탈로그(리전 지정 + 최신 실행 포함)
-curl "http://localhost:8300/sagemaker/pipelines?regions=ap-northeast-2&includeLatestExec=true"
-
-# 단일 파이프라인 라인리지(데이터 중심 보기)
-curl "http://localhost:8300/lineage?region=ap-northeast-2&pipeline=mlops-pipeline&view=data&includeLatestExec=true"
-
-# 도메인 단위 일괄 라인리지
-curl "http://localhost:8300/lineage/by-domain?region=ap-northeast-2&domain=studio-a&includeLatestExec=true"
-
-# S3 경로 스키마 샘플링(+저장)
-curl "http://localhost:8300/datasets/my-bucket/path/to/prefix/schema?region=ap-northeast-2&save=true"
-
-# 스키마 버전 목록
-curl "http://localhost:8300/datasets/my-bucket/path/to/prefix/schema/versions?region=ap-northeast-2"
-
-# Feature Group 목록/상세
-curl "http://localhost:8300/featurestore/feature-groups?region=ap-northeast-2"
-curl "http://localhost:8300/featurestore/feature-groups/user_profiles?region=ap-northeast-2"
-```
-
-> 로컬 자격증명 사용: `AWS_PROFILE=dev` 환경변수 또는 쿼리스트링 `&profile=dev`  
-> 운영 배포: 인스턴스 프로파일/IRSA 등 **Role 기반** 권장
-
----
-
-## 🔐 최소 권한(IAM)
-
-- SageMaker: `ListPipelines`, `GetPipeline`, `ListPipelineExecutions`, `DescribePipelineDefinitionForExecution`, `ListPipelineExecutionSteps`, `Describe*Job`, `ListTags`
-- S3: `GetBucketLocation`, `GetBucketEncryption`, `GetBucketVersioning`, `GetPublicAccessBlock`, `GetBucketTagging`, `GetObject`(평가리포트/샘플용)
-- (Feature Store 사용 시) `sagemaker:DescribeFeatureGroup`, `sagemaker:ListFeatureGroups`
-
-리소스 범위는 **특정 파이프라인/버킷으로 제한**하는 것을 추천합니다.
-
----
-
-## 🧑‍💻 프론트엔드 연동 가이드 (간단 ver.)
-
-### 1) 데이터 소스 로딩
-```ts
-// 초기 1회: 카탈로그
-const catalog = await fetch(`/sagemaker/pipelines?regions=ap-northeast-2&includeLatestExec=true`).then(r=>r.json());
-
-// 사용자 선택에 따라
-const region   = "ap-northeast-2";
-const pipeline = "mlops-pipeline";
-const domain   = "studio-a";
-
-// 라인리지(뷰 전환 지원)
-const lineage = await fetch(`/lineage?region=${region}&pipeline=${pipeline}&domain=${domain}&view=both&includeLatestExec=true`).then(r=>r.json());
-
-// 데이터 스키마
-const sch = await fetch(`/datasets/my-bucket/path/to/prefix/schema?region=${region}`).then(r=>r.json());
-
-// Feature Group
-const fgs = await fetch(`/featurestore/feature-groups?region=${region}`).then(r=>r.json());
-```
-
-### 2) 간단 UI 구성 제안
-- **좌측 패널**: Region / Domain / Pipeline 선택 드롭다운 + 검색
-- **상단 탭**: `Pipeline` | `Data` | `Both`
-  - *Pipeline*: DAG(노드/엣지) + **스텝 상태 칩**(Succeeded/Failed/Executing) + 경과시간
-  - *Data*: **Artifacts 리스트**(S3 URI) + 각 항목 클릭 시 **스키마 패널** 열기
-  - *Both*: DAG와 아티팩트를 좌/우 Split로 동시 표시
-- **우측 상세 패널** (선택 시 표시)
-  - 노드: 입력/출력 URI, 실행시간, 상태, (있으면) **메트릭(JSON)** 미니 테이블
-  - 아티팩트: S3 메타(Region/암호화/버저닝/PublicAccess), **스키마 필드/타입**, 샘플 파일 목록
-- **부가**: Feature Group 탭(목록 → 선택 시 컬럼/스토어 설정 표시), 스키마 **버전 드롭다운**
-
-> 그래프는 React Flow / Cytoscape.js, 테이블은 shadcn/ui + Tailwind 조합을 권장합니다.
-
----
-
-## 🧩 코드 변화 포인트 (추가된 모듈/엔드포인트 설명)
-
-- `modules/parquet_probe.py`
-  - `pyarrow` + `S3FileSystem`으로 **원격 S3의 Parquet 메타 스키마**를 정확히 추출합니다.
-- `modules/schema_sampler.py`
-  - S3 프리픽스에서 **최대 N개 오브젝트**를 샘플링하고, 포맷별(JSON/CSV/Parquet) 스키마를 **머지**합니다.
-- `modules/schema_store.py`
-  - `dataset_id`(s3://bucket/prefix), `policy`(任意 JSON) → `policyHash` 기반 **버저닝 저장/조회**.
-- `modules/sql_lineage_light.py`
-  - `INSERT .. SELECT` / `CREATE TABLE AS SELECT` 구문에서 **src/dst/cols**를 가볍게 추출(실서비스는 `sqlglot` 권장).
-- `modules/featurestore_schema.py`
-  - Feature Group **목록/상세** API용 래퍼.
-- `api.py` (핵심 라우트 추가)
-  - `GET /sagemaker/pipelines`
-  - `GET /datasets/{{bucket}}/{{prefix}}/schema`
-  - `GET /datasets/{{bucket}}/{{prefix}}/schema/versions`
-  - `GET /featurestore/feature-groups`, `GET /featurestore/feature-groups/{name}`
-  - `GET /lineage`의 `view` 파라미터 지원
-
----
-
-## 🐳 Docker 실행 예시
-
-```bash
-docker build -t lineage-api:1.4 .
-docker run --rm -p 8300:8300 -e AWS_PROFILE=default -v ~/.aws:/root/.aws:ro lineage-api:1.4
-# 헬스체크
-curl http://localhost:8300/health
+graph TD
+A[SQL 수집 (Collector)] --> B[SQL 파싱 (sql_lineage_light)]
+B --> C[라인리지 저장 (sql_lineage_store)]
+C --> D[라인리지 생성 (lineage.py)]
+D --> E[FastAPI 응답 (api.py)]
+E --> F[Frontend DAG 시각화]
 ```
 
 ---
 
-## ⚠️ 운영 팁
-
-- **리전 제한**: 대규모 계정은 `ALLOWED_REGIONS`(환경변수)로 제한하고, 프론트는 **필터링만** 수행
-- **캐시**: 파이프라인/카탈로그 응답은 프런트에서 30~60초 정도 캐싱
-- **보안**: CORS/최소권한/IAM Role/CloudWatch Logs/헬스체크 설정 권장
-- **PyArrow**: Lambda 컨테이너 등에서는 **플랫폼 빌드** 주의(이미지 기반 배포 권장)
-
----
-
-## 📎 샘플 응답 스니펫 (라인리지 요약)
+## 🧩 응답 예시
 
 ```json
 {
-  "pipeline": {"name":"mlops-pipeline","arn":"...","lastModifiedTime":"..."},
   "summary": {
-    "overallStatus":"Succeeded",
-    "nodeStatus":{"Succeeded":12,"Failed":0,"Executing":0},
-    "elapsedSec": 1234
+    "pipeline": "MyPipe",
+    "region": "ap-northeast-2",
+    "steps": [
+      {
+        "id": "Preprocess",
+        "type": "Processing",
+        "inputs": [{"uri": "s3://bucket/in/train.csv"}],
+        "outputs": [{"uri": "s3://bucket/out/prep.parquet"}],
+        "run": {"status": "Succeeded", "elapsedSec": 245, "metrics": {"eval.f1": 0.91}},
+        "hasSql": true,
+        "sqlDst": "db.tbl_out",
+        "sqlSources": ["db.tbl_in"]
+      }
+    ]
   },
-  "graph": {
-    "nodes":[{"id":"Preprocess","type":"Processing","inputs":[...],"outputs":[...],"run":{"status":"Succeeded"}}],
-    "edges":[{"from":"Preprocess","to":"Train","via":"dependsOn"}],
-    "artifacts":[{"id":0,"uri":"s3://bucket/path/part-0000.parquet","s3":{"region":"ap-northeast-2","encryption":"AES256"}}]
+  "graphPipeline": {
+    "nodes": [
+      {"id": "process:Preprocess", "kind": "process", "label": "Preprocess"},
+      {"id": "data:s3://bucket/in/train.csv", "kind": "data", "label": "train.csv"}
+    ],
+    "edges": [
+      {"source": "data:s3://bucket/in/train.csv", "target": "process:Preprocess", "kind": "read"},
+      {"source": "process:Preprocess", "target": "data:s3://bucket/out/prep.parquet", "kind": "write"}
+    ]
   }
 }
+```
+
+---
+
+## 💻 Frontend 연동 가이드
+
+### ✅ 호출 예시 (React/TypeScript)
+```tsx
+const res = await fetch(`/lineage?pipeline=${pipeline}&region=${region}&view=both&includeLatestExec=true`);
+const data = await res.json();
+const graph = data.graphPipeline;
+
+const elements = [
+  ...graph.nodes.map(n => ({ data: { id: n.id, label: n.label, kind: n.kind } })),
+  ...graph.edges.map(e => ({ data: { source: e.source, target: e.target, kind: e.kind } }))
+];
+```
+
+### 🎨 시각화 권장 라이브러리
+- **Cytoscape.js** + **elk layout** → DAG 구조 정렬
+- **vis-network** → 대화형 확대/축소 지원
+
+### 💡 UX 권장 포인트
+- 노드 클릭 → 사이드패널에 상세정보(SQL, Run, Metrics)
+- 엣지 hover → `read` / `write` 방향 표시 및 데이터 URI 툴팁
+- `Pipeline / Data / Both` 토글 지원
+- 상태별 색상 구분 (`Succeeded`, `Failed`, `Executing` 등)
+
+---
+
+## 🧠 Inline SQL 체험 플로우
+
+1️⃣ 사용자 SQL 입력 → POST `/tasks/sql/inline` 전송  
+2️⃣ SQL 파싱 및 결과 저장 → `data/sql_lineage.jsonl`  
+3️⃣ `/lineage?pipeline={pipeline}` 호출 시 Inline 스텝 포함 그래프 생성  
+
+---
+
+## 🐳 Docker 실행 (선택)
+
+```bash
+docker build -t dspm-lineage .
+docker run -d -p 8300:8300 dspm-lineage
 ```
