@@ -180,24 +180,29 @@ async def fetch_schema_layer(
         # 3) 스키마 fetch with fallback(latest version)
         async def fetch_dataset_schema(uri: str) -> Dict[str, Any]:
             try:
-                bkt, pfx = parse_s3_uri(uri)
+                bucket, prefix = parse_s3_uri(uri)
 
-                # 1차: exact
-                res = await client.get(f"/datasets/{bkt}/{pfx}/schema")
-                if res.status_code == 200:
-                    return {"uri": uri, "ok": True, "data": res.json()}
+                # uri에서 상위 폴더로 한 단계씩 올라가며 /schema 조회
+                parts = prefix.split("/")
+                tried = []
+                for i in range(len(parts), 0, -1):
+                    candidate = "/".join(parts[:i])
+                    tried.append(candidate)
+                    res = await client.get(f"/datasets/{bucket}/{candidate}/schema")
+                    if res.status_code == 200:
+                        data = res.json() or {}
+                        # 어떤 prefix에 매칭됐는지 같이 반환
+                        return {
+                            "uri": uri,
+                            "ok": True,
+                            "data": data,
+                            "bucket": bucket,
+                            "matched_prefix": candidate,
+                        }
 
-                # 2차: versions -> latest pick
-                vers = await client.get(f"/datasets/{bkt}/{pfx}/schema/versions")
-                if vers.status_code == 200:
-                    vlist = vers.json() or []
-                    if vlist:
-                        latest = vlist[-1]  # 마지막=최신
-                        res2 = await client.get(f"/datasets/{bkt}/{latest}/schema")
-                        if res2.status_code == 200:
-                            return {"uri": uri, "ok": True, "data": res2.json()}
+                # 마지막으로 제일 상위 prefix도 안 되면 실패
+                return {"uri": uri, "ok": False, "error": f"no schema for {tried}"}
 
-                return {"uri": uri, "ok": False, "error": f"schema not found"}
             except Exception as e:
                 return {"uri": uri, "ok": False, "error": str(e)}
 
@@ -206,35 +211,79 @@ async def fetch_schema_layer(
         # 4) normalize -> tables/columns
         tables: List[Dict[str, Any]] = []
         columns: List[Dict[str, Any]] = []
+
         for res in dataset_results:
             if not res["ok"]:
-                warnings.append(f"{res['uri']}: {res.get('error','unknown')}")
+                warnings.append(f"{res['uri']}: {res.get('error')}")
                 continue
-            uri = res["uri"]
-            d = res["data"] or {}
-            t_name = d.get("table") or uri.split("/")[-1]
-            t_ver = d.get("version") or d.get("schemaVersion")
+
+            data = res["data"] or {}
+            bucket = res["bucket"]
+            matched_prefix = res["matched_prefix"]
+
+            # dataset_id 없으면 matched_prefix로 구성
+            dataset_id = (
+                data.get("dataset_id")
+                or data.get("id")
+                or f"s3://{bucket}/{matched_prefix}"
+            )
+
+            # table 이름: dataset_id 마지막 토큰 (pipelines::exp1 -> exp1)
+            raw_name = dataset_id.split("::")[-1]
+            t_name = raw_name.rstrip("/").split("/")[-1]
             t_id = f"table:{t_name}"
+
+            # 이 스키마가 커버하는 data 노드들과 연결
+            links: List[str] = []
+            prefix_uri = f"s3://{bucket}/{matched_prefix}"
+            for node_id, s3 in artifact_map.items():
+                if s3.startswith(prefix_uri):
+                    links.append(node_id)
+
+            links = sorted(set(links))
+            if not links:
+                # 연결되는 data 노드가 없으면 굳이 노출 안 해도 됨 (원하면 남겨도 됨)
+                continue
 
             tables.append({
                 "id": t_id,
                 "name": t_name,
-                "version": t_ver,
-                "links": [data_node_id_from_uri(uri)],
-                "changed": d.get("changed"),
+                "version": data.get("version"),
+                "links": links,
             })
-            for c in (d.get("columns") or []):
-                c_name = c.get("name") or ""
-                c_type = c.get("type") or c.get("dtype")
+
+            # ----- 컬럼 추출 -----
+            # 1) columns 배열 형식이 있으면 우선
+            raw_cols = data.get("columns")
+
+            # 2) schema.fields 형식 파싱
+            if not raw_cols and isinstance(data.get("schema"), dict):
+                fields = data["schema"].get("fields") or {}
+                raw_cols = []
+                for cname, meta in fields.items():
+                    # 필요 없으면 샘플/메타 필드 제외할 수도 있음
+                    if cname in ("sampled_files",):
+                        continue
+                    ctype = None
+                    if isinstance(meta, dict):
+                        ts = meta.get("types") or meta.get("type")
+                        if isinstance(ts, list):
+                            ctype = " | ".join(str(t) for t in ts)
+                        else:
+                            ctype = ts
+                    raw_cols.append({"name": cname, "type": ctype})
+
+            for c in raw_cols or []:
+                cname = c.get("name")
+                if not cname:
+                    continue
+                ctype = c.get("type")
                 columns.append({
-                    "id": f"column:{t_name}.{c_name}",
-                    "name": c_name,
+                    "id": f"column:{t_name}.{cname}",
+                    "name": cname,
                     "tableId": t_id,
-                    "type": c_type,
-                    "nullable": c.get("nullable"),
-                    "pii_tag": c.get("pii") or c.get("pii_tag"),
-                    "changed": c.get("changed"),
-                    "links": [data_node_id_from_uri(uri)],
+                    "type": ctype,
+                    "links": links,
                 })
 
         # 5) Feature Store (region 필수)
@@ -300,6 +349,10 @@ async def fetch_schema_layer(
             except Exception as e:
                 warnings.append(f"sql lineage: {e}")
 
+        # id 기준으로 중복 제거
+        tables = list({t["id"]: t for t in tables}.values())
+        columns = list({c["id"]: c for c in columns}.values())
+        
         return {
             "tables": tables,
             "columns": columns,
