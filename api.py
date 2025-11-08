@@ -149,19 +149,25 @@ async def fetch_schema_layer(
             node_id = dn.get("id") or ""
             
             # id 규칙이 data:s3://... 인 케이스
-            if node_id.startswith("data:s3:"):
+            if node_id.startswith("data:s3://"):
                 s3 = node_id[5:]
                 if is_data_uri(s3):
                     artifact_map[node_id] = s3
+                    print(f"[fetch_schema_layer] Mapped from node_id: {node_id} -> {s3}")
                 continue
 
             # uri 필드에서 추출
             uri = dn.get("uri")
             if is_data_uri(uri):
+                mapped_id = data_node_id_from_uri(uri)
                 artifact_map[data_node_id_from_uri(uri)] = uri
+                print(f"[fetch_schema_layer] Mapped from uri: {mapped_id} -> {uri}")
 
         # 후보 URI 정리
         uris = sorted(set(artifact_map.values()))
+        print(f"[fetch_schema_layer] Total unique URIs: {len(uris)}")
+        for uri in uris:
+            print(f"  - {uri}")
 
         # URI가 없어도 계속 진행 (SQL 라인리지에서 테이블 정보 가져올 수 있음)
         if not uris:
@@ -186,7 +192,7 @@ async def fetch_schema_layer(
         async def fetch_dataset_schema(uri: str) -> Dict[str, Any]:
             try:
                 bucket, prefix = parse_s3_uri(uri)
-                parts = prefix.split("/")
+                parts = [p for p in prefix.split("/") if p]
                 tried = []
 
                 # uri에서 상위 폴더로 한 단계씩 올라가며 /schema 조회
