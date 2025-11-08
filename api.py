@@ -175,18 +175,14 @@ async def fetch_schema_layer(
 
         # (선택) 스캔 트리거
         if scan_if_missing and uris:
-            targets = []
             for u in uris:
                 try:
-                    b, p = parse_s3_uri(u)
-                    targets.append({"bucket": b, "prefix": p})
-                except:
-                    pass
-            if targets:
-                try:
-                    await client.post("/datasets/schema/scan", json={"targets": targets})
+                    await client.post(
+                        "/datasets/schema/scan",
+                        params={"region": region, "s3_uri": u},
+                    )
                 except Exception as e:
-                    warnings.append(f"schema scan failed (ignored): {e}")
+                    warnings.append(f"schema scan failed for {u}: {e}")
 
         # 3) 스키마 fetch with fallback(latest version)
         async def fetch_dataset_schema(uri: str) -> Dict[str, Any]:
