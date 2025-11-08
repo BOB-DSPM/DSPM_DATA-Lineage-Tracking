@@ -136,7 +136,7 @@ async def fetch_schema_layer(
 
     async with httpx.AsyncClient(base_url=base, timeout=timeout_s) as client:
         # 1) 라인리지(graphData 확보)
-        r = await client.get("/lineage", params={"pipeline": pipeline, "region": region})
+        r = await client.get("/lineage", params={"pipeline": pipeline, "region": region, "view": "data"})
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"lineage fetch failed: {r.text}")
         lineage = r.json() or {}
@@ -147,44 +147,49 @@ async def fetch_schema_layer(
         artifact_map: Dict[str, str] = {}  # nodeId -> s3://...
         for dn in (n for n in nodes if n.get("type") == "dataArtifact"):
             node_id = dn.get("id") or ""
+            
             # id 규칙이 data:s3://... 인 케이스
-            if node_id.startswith("data:s3://"):
-                s3 = node_id[len("data:"):]
+            if node_id.startswith("data:s3:"):
+                s3 = node_id[5:]
                 if is_data_uri(s3):
                     artifact_map[node_id] = s3
                 continue
-            # data 안에 uri/s3Uri/location이 있는 케이스
-            meta = dn.get("data") or {}
-            uri = meta.get("uri") or meta.get("s3Uri") or meta.get("location")
-            if isinstance(uri, dict) and "Get" in uri:
-                uri = uri["Get"]
+
+            # uri 필드에서 추출
+            uri = dn.get("uri")
             if is_data_uri(uri):
                 artifact_map[data_node_id_from_uri(uri)] = uri
 
         # 후보 URI 정리
         uris = sorted(set(artifact_map.values()))
+
+        # URI가 없어도 계속 진행 (SQL 라인리지에서 테이블 정보 가져올 수 있음)
         if not uris:
-            return {"tables": [], "columns": [], "featureGroups": [], "features": [], "warnings": ["no data artifacts found"]}
+            warnings.append("no data artifacts found in lineage graph")
 
         # (선택) 스캔 트리거
-        if scan_if_missing:
+        if scan_if_missing and uris:
             targets = []
             for u in uris:
-                b, p = parse_s3_uri(u)
-                targets.append({"bucket": b, "prefix": p})
-            try:
-                await client.post("/datasets/schema/scan", json={"targets": targets})
-            except Exception as e:
-                warnings.append(f"schema scan failed (ignored): {e}")
+                try:
+                    b, p = parse_s3_uri(u)
+                    targets.append({"bucket": b, "prefix": p})
+                except:
+                    pass
+            if targets:
+                try:
+                    await client.post("/datasets/schema/scan", json={"targets": targets})
+                except Exception as e:
+                    warnings.append(f"schema scan failed (ignored): {e}")
 
         # 3) 스키마 fetch with fallback(latest version)
         async def fetch_dataset_schema(uri: str) -> Dict[str, Any]:
             try:
                 bucket, prefix = parse_s3_uri(uri)
-
-                # uri에서 상위 폴더로 한 단계씩 올라가며 /schema 조회
                 parts = prefix.split("/")
                 tried = []
+
+                # uri에서 상위 폴더로 한 단계씩 올라가며 /schema 조회
                 for i in range(len(parts), 0, -1):
                     candidate = "/".join(parts[:i])
                     tried.append(candidate)
@@ -206,7 +211,9 @@ async def fetch_schema_layer(
             except Exception as e:
                 return {"uri": uri, "ok": False, "error": str(e)}
 
-        dataset_results = await asyncio.gather(*(fetch_dataset_schema(u) for u in uris))
+        dataset_results = []
+        if uris:
+            dataset_results = await asyncio.gather(*(fetch_dataset_schema(u) for u in uris))
 
         # 4) normalize -> tables/columns
         tables: List[Dict[str, Any]] = []
@@ -241,15 +248,14 @@ async def fetch_schema_layer(
                     links.append(node_id)
 
             links = sorted(set(links))
-            if not links:
-                # 연결되는 data 노드가 없으면 굳이 노출 안 해도 됨 (원하면 남겨도 됨)
-                continue
-
+            
+            # links가 없어도 테이블은 추가 (프론트에 표시하기 위해)
             tables.append({
                 "id": t_id,
                 "name": t_name,
                 "version": data.get("version"),
                 "links": links,
+                "s3_prefix": matched_prefix,  # 디버깅용
             })
 
             # ----- 컬럼 추출 -----
@@ -286,14 +292,71 @@ async def fetch_schema_layer(
                     "links": links,
                 })
 
-        # 5) Feature Store (region 필수)
+        # 5) SQL 라인리지로 테이블 보강 (스키마가 없을 때 중요!)
+        if include_sql:
+            try:
+                sqlr = await client.get(f"/pipelines/{pipeline}/sql-lineage", params={"region": region})
+                if sqlr.status_code == 200:
+                    sql = sqlr.json() or {}
+                    sql_tables = sql.get("steps", [])
+                    
+                    # 🔥 SQL에서 발견된 테이블 추가
+                    for step in sql_tables:
+                        dst = step.get("dst")
+                        if not dst:
+                            continue
+                        
+                        t_name = dst.split(".")[-1]  # schema.table -> table
+                        t_id = f"table:{t_name}"
+                        
+                        # 이미 추가된 테이블인지 확인
+                        if any(t["id"] == t_id for t in tables):
+                            continue
+                        
+                        # SQL에서만 발견된 테이블 추가
+                        tables.append({
+                            "id": t_id,
+                            "name": t_name,
+                            "version": None,
+                            "links": [],
+                            "source": "sql",  # SQL에서 온 정보임을 표시
+                            "step": step.get("step"),
+                        })
+                        
+                        # 컬럼 정보도 추가
+                        for col_name in (step.get("columns") or []):
+                            if not col_name:
+                                continue
+                            columns.append({
+                                "id": f"column:{t_name}.{col_name}",
+                                "name": col_name,
+                                "tableId": t_id,
+                                "type": "unknown",
+                                "links": [],
+                                "source": "sql",
+                            })
+                    
+                    # 기존 테이블 정보 보강
+                    sql_tables_map = { t.get("dst"): t for t in sql_tables if t.get("dst") }
+                    for t in tables:
+                        if t.get("source") == "sql":
+                            continue
+                        st = sql_tables_map.get(t["name"])
+                        if st:
+                            t["sql_step"] = st.get("step")
+                            t["sql_file"] = st.get("file")
+                            
+            except Exception as e:
+                warnings.append(f"sql lineage: {e}")
+
+        # 6) Feature Store
         feature_groups: List[Dict[str, Any]] = []
         features: List[Dict[str, Any]] = []
         if include_featurestore:
             try:
                 fg_list = await client.get("/featurestore/feature-groups", params={"region": region})
                 if fg_list.status_code == 200:
-                    for fg in (fg_list.json() or []):
+                    for fg in (fg_list.json().get("items", []) or []):
                         name = fg.get("FeatureGroupName") or fg.get("name")
                         if not name:
                             continue
@@ -325,34 +388,15 @@ async def fetch_schema_layer(
             except Exception as e:
                 warnings.append(f"feature store: {e}")
 
-        # 6) SQL 라인리지 보강
-        if include_sql:
-            try:
-                sqlr = await client.get(f"/pipelines/{pipeline}/sql-lineage", params={"region": region})
-                if sqlr.status_code == 200:
-                    sql = sqlr.json() or {}
-                    sql_tables = { t.get("name"): t for t in (sql.get("tables") or []) }
-                    sql_cols = { (c.get("table"), c.get("name")): c for c in (sql.get("columns") or []) }
-                    # 테이블 보강
-                    for t in tables:
-                        st = sql_tables.get(t["name"])
-                        if st:
-                            t["version"] = t.get("version") or st.get("version")
-                            t["changed"] = t.get("changed") or st.get("changed")
-                    # 컬럼 보강
-                    for c in columns:
-                        key = (c.get("tableId","table:").split("table:",1)[-1], c["name"])
-                        sc = sql_cols.get(key)
-                        if sc:
-                            c["type"] = c.get("type") or sc.get("type")
-                            c["changed"] = c.get("changed") or sc.get("changed")
-            except Exception as e:
-                warnings.append(f"sql lineage: {e}")
-
         # id 기준으로 중복 제거
         tables = list({t["id"]: t for t in tables}.values())
         columns = list({c["id"]: c for c in columns}.values())
         
+        # 디버깅 정보 추가
+        print(f"[schema] Pipeline: {pipeline}, Tables: {len(tables)}, Columns: {len(columns)}")
+        if tables:
+            print(f"[schema] Table names: {[t['name'] for t in tables]}")
+
         return {
             "tables": tables,
             "columns": columns,
@@ -707,6 +751,27 @@ async def get_lineage_schema(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schema layer error: {e}")
+    
+@app.get("/schema", summary="Get Schema (Alias)")
+async def get_schema_alias(
+    request: Request,
+    pipeline: str = Query(...),
+    region: str = Query("ap-northeast-2"),
+    include_featurestore: bool = Query(True),
+    include_sql: bool = Query(True),
+    scan_if_missing: bool = Query(False),
+):
+    """
+    /schema 엔드포인트 (프론트와의 호환성을 위한 별칭)
+    """
+    return await fetch_schema_layer(
+        request=request,
+        pipeline=pipeline,
+        region=region,
+        include_featurestore=include_featurestore,
+        include_sql=include_sql,
+        scan_if_missing=scan_if_missing,
+    )
 
 # -----------------------------------------------------------------------------#
 # Entrypoint
