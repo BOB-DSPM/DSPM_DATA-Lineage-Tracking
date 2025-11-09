@@ -545,7 +545,7 @@ def enrich_artifact_s3_meta(artifacts: List[Dict[str,Any]], session: boto3.sessi
         except Exception:
             pass
         a["s3"] = meta
-_ANALYZER_API = os.getenv("ANALYZER_API", "http://211.44.183.248:9000")
+_ANALYZER_API = os.getenv("ANALYZER_API", "http://43.202.228.52:9000")
 
 def _to_analyzer_source_key(s3_uri: str) -> Optional[str]:
     """
