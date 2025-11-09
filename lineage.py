@@ -8,6 +8,7 @@ import botocore
 # Helpers (refs & S3 parsing)
 # ---------------------------
 
+import os
 import requests
 from urllib.parse import quote as urlquote
 
