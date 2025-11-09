@@ -8,6 +8,10 @@ import botocore
 # Helpers (refs & S3 parsing)
 # ---------------------------
 
+import requests
+from urllib.parse import quote as urlquote
+
+
 _REF_RE = re.compile(r"Steps\.([A-Za-z0-9\-_]+)")
 _S3_RE  = re.compile(r"^s3://([^/]+)/?(.*)$")
 
@@ -540,6 +544,131 @@ def enrich_artifact_s3_meta(artifacts: List[Dict[str,Any]], session: boto3.sessi
         except Exception:
             pass
         a["s3"] = meta
+_ANALYZER_API = os.getenv("ANALYZER_API", "http://211.44.183.248:9000")
+
+def _to_analyzer_source_key(s3_uri: str) -> Optional[str]:
+    """
+    Analyzer가 결과를 저장할 때 자주 쓰는 경로 포맷 's3/<bucket>/<key>' 로 변환
+    (results_front_by_source.json 기준)
+    """
+    m = re.match(r"^s3://([^/]+)/?(.*)$", s3_uri or "")
+    if not m:
+        return None
+    bucket, key = m.group(1), m.group(2)
+    if not bucket or not key:
+        return None
+    return f"s3/{bucket}/{key}"
+
+def _probe_analyzer_entities_by_source(source_key: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """
+    /api/result/front-source/{SOURCE}/entities 를 우선 조회
+    실패 시 None
+    """
+    url = f"{_ANALYZER_API}/api/result/front-source/{urlquote(source_key, safe='')}/entities"
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            # 기대형태 예: {"entities": {"EMAIL_ADDRESS":{"count":40,...}, ...}, "category":"public", ...}
+            return {"ok": True, "data": data, "detailUrl": url}
+    except Exception:
+        pass
+    return None
+
+def _fallback_probe_analyzer_front_list(s3_uri: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """
+    보수적 폴백: /api/result/front-list?has_entities=any 로 일부 페이지를 가져와
+    file/source 일치 항목을 찾아 집계. (규모가 크면 Analyzer에 별도 조회 API 추가 권장)
+    """
+    url = f"{_ANALYZER_API}/api/result/front-list?has_entities=any&page=1&size=200"
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        js = r.json()
+        items = js.get("items", [])
+        # 비교 후보: 's3://bucket/key', 's3/bucket/key' 두 형태 모두 시도
+        cand = {s3_uri, (_to_analyzer_source_key(s3_uri) or "")}
+        entities_total: Dict[str, int] = {}
+        for it in items:
+            f = it.get("file") or it.get("source") or ""
+            if f in cand:
+                ents = (it.get("entities") or {})
+                # entities는 {"KR_NAME":{"count":1,"values":[...]}, ...} 형태라고 가정
+                for k, v in ents.items():
+                    cnt = (v or {}).get("count", 0)
+                    if cnt:
+                        entities_total[k] = entities_total.get(k, 0) + int(cnt)
+        if not entities_total:
+            return {"ok": True, "data": {"entities": {}, "category": "none"}, "detailUrl": url}
+        # 카테고리 유추(rough): identifiers > sensitive > public > none
+        def _guess_category(keys: List[str]) -> str:
+            id_keys = {"KR_RRN", "KR_PASSPORT", "KR_DRIVER_LICENSE"}
+            sens_keys = {"ICD10_CODE", "RELIGION", "POLITICAL_OPINION", "UNION"}
+            if any(k in id_keys for k in keys): return "identifiers"
+            if any(k in sens_keys for k in keys): return "sensitive"
+            return "public"
+        cat = _guess_category(list(entities_total.keys()))
+        return {"ok": True, "data": {"entities": entities_total, "category": cat}, "detailUrl": url}
+    except Exception:
+        return None
+
+def _classify_category_from_analyzer_payload(payload: Dict[str, Any]) -> Tuple[bool, str, Dict[str,int]]:
+    """
+    Analyzer 응답(payload)에서 hasPII/카테고리/집계를 추출
+    """
+    ents = {}
+    category = (payload or {}).get("category") or "none"
+    # payload가 {"entities":{"EMAIL_ADDRESS":{"count":40}, ...}} 형태인 경우
+    entities_obj = (payload or {}).get("entities") or {}
+    if isinstance(entities_obj, dict):
+        for k, v in entities_obj.items():
+            if isinstance(v, dict) and "count" in v:
+                if int(v["count"]) > 0:
+                    ents[k] = int(v["count"])
+            elif isinstance(v, int):
+                if v > 0:
+                    ents[k] = v
+    has = bool(ents)
+    if not has:
+        category = "none"
+    return has, category, ents
+
+def enrich_artifacts_with_pii_flags(artifacts: List[Dict[str, Any]]) -> None:
+    """
+    artifacts[*]에 pii 필드 추가:
+      pii: { "hasPII": bool, "category": str, "counts": {...}, "detailUrl": str }
+    """
+    for a in artifacts:
+        uri = a.get("uri")
+        if not isinstance(uri, str) or not uri.startswith("s3://"):
+            continue
+        source_key = _to_analyzer_source_key(uri)
+        payload = None
+        detail_url = None
+
+        # 1차: front-source/{SOURCE}/entities
+        if source_key:
+            p = _probe_analyzer_entities_by_source(source_key)
+            if p and p.get("ok"):
+                payload = (p.get("data") or {})
+                detail_url = p.get("detailUrl")
+
+        # 2차 폴백: front-list 조회
+        if payload is None:
+            p = _fallback_probe_analyzer_front_list(uri)
+            if p and p.get("ok"):
+                payload = (p.get("data") or {})
+                if not detail_url:
+                    detail_url = p.get("detailUrl")
+
+        has, category, counts = _classify_category_from_analyzer_payload(payload or {})
+        a["pii"] = {
+            "hasPII": has,
+            "category": category,                 # public | sensitive | identifiers | none
+            "counts": counts,                     # 엔티티별 합계
+            "detailUrl": detail_url,              # Analyzer에서 더 자세히 볼 수 있는 호출 URL
+        }
 
 # ---------------------------
 # pipelines with domain (for /sagemaker/pipelines, /lineage/by-domain)
@@ -607,6 +736,8 @@ def get_lineage_json(
     include_latest_exec: bool = False,
     profile: Optional[str] = None,
     view: str = "both",  # "pipeline" | "data" | "both"
+    ### NEW
+    include_pii: bool = False,
 ) -> Dict[str, Any]:
     """
     단건 파이프라인의 라인리지 그래프 데이터를 생성
@@ -654,6 +785,17 @@ def get_lineage_json(
         pass
     enrich_artifact_s3_meta(graph_pipeline["artifacts"], session)
 
+    ### NEW: 여기서 PII 플래그 보강
+    if include_pii:
+        try:
+            enrich_artifacts_with_pii_flags(graph_pipeline["artifacts"])
+        except Exception as e:
+            # 실패해도 전체 라인리지는 계속 반환
+            for a in graph_pipeline.get("artifacts", []):
+                a.setdefault("pii", {"hasPII": False, "category": "unknown", "counts": {}, "detailUrl": None})
+            # (로그만 남기고 무시)
+            print(f"[warn] pii enrichment failed: {e}")
+
     # (3-2) 요약(파이프라인 기준)
     summary = pipeline_summary(graph_pipeline)
 
@@ -676,7 +818,6 @@ def get_lineage_json(
         result["graphData"] = graph_data
 
     return result
-
 # ---------------------------
 # Enrich nodes with SQL lineage info
 # ---------------------------

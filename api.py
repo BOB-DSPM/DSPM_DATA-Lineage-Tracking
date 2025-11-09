@@ -479,6 +479,8 @@ def lineage_endpoint(
     includeLatestExec: bool = Query(False, description="Include latest execution info"),
     profile: str | None = Query(None, description="Local dev only; AWS profile name"),
     view: str = Query("both", regex="^(pipeline|data|both)$", description="pipeline | data | both"),
+    ### NEW
+    includePII: bool = Query(False, description="Analyzer와 연동해 artifact별 PII 플래그/집계 포함"),
 ):
     try:
         data = lineage_lib.get_lineage_json(
@@ -488,6 +490,8 @@ def lineage_endpoint(
             include_latest_exec=includeLatestExec,
             profile=profile,
             view=view,
+            ### NEW
+            include_pii=includePII,
         )
         return data
     except ValueError as ve:
@@ -511,6 +515,8 @@ def lineage_by_domain(
     includeLatestExec: bool = Query(False),
     profile: str | None = Query(None),
     view: str = Query("both", regex="^(pipeline|data|both)$"),
+    ### NEW
+    includePII: bool = Query(False, description="Analyzer와 연동해 artifact별 PII 플래그/집계 포함"),
 ):
     try:
         pipes = lineage_lib.list_pipelines_with_domain(region=region, profile=profile)
@@ -532,6 +538,8 @@ def lineage_by_domain(
                     include_latest_exec=includeLatestExec,
                     profile=profile,
                     view=view,
+                    ### NEW
+                    include_pii=includePII,
                 )
                 results.append({"pipeline": name, "ok": True, "data": data})
             except Exception as e:
@@ -542,7 +550,6 @@ def lineage_by_domain(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"by-domain error: {e}")
-
 # -----------------------------------------------------------------------------#
 # 4) Dataset schema endpoints
 # -----------------------------------------------------------------------------#
