@@ -29,7 +29,7 @@ import lineage as lineage_lib
 # -----------------------------------------------------------------------------#
 # FastAPI
 # -----------------------------------------------------------------------------#
-app = FastAPI(title="SageMaker Lineage API", version="1.6.0")
+app = FastAPI(title="SageMaker Lineage API", version="1.6.1")
 
 # CORS (운영 시 특정 도메인으로 제한 권장)
 app.add_middleware(
@@ -136,14 +136,12 @@ async def fetch_schema_layer(
         artifact_map: Dict[str, str] = {}  # nodeId -> s3://...
         for dn in (n for n in nodes if n.get("type") == "dataArtifact"):
             node_id = dn.get("id") or ""
-            
             # id 규칙이 data:s3://... 인 케이스
             if node_id.startswith("data:s3://"):
                 s3 = node_id[5:]
                 if is_data_uri(s3):
                     artifact_map[node_id] = s3
                 continue
-
             # uri 필드에서 추출
             uri = dn.get("uri")
             if is_data_uri(uri):
@@ -174,7 +172,6 @@ async def fetch_schema_layer(
                 bucket, prefix = parse_s3_uri(uri)
                 parts = [p for p in prefix.split("/") if p]
                 tried = []
-
                 # uri에서 상위 폴더로 한 단계씩 올라가며 /schema 조회
                 for i in range(len(parts), 0, -1):
                     candidate = "/".join(parts[:i])
@@ -190,10 +187,8 @@ async def fetch_schema_layer(
                             "bucket": bucket,
                             "matched_prefix": candidate,
                         }
-
                 # 마지막으로 제일 상위 prefix도 안 되면 실패
                 return {"uri": uri, "ok": False, "error": f"no schema for {tried}"}
-
             except Exception as e:
                 return {"uri": uri, "ok": False, "error": str(e)}
 
@@ -232,9 +227,8 @@ async def fetch_schema_layer(
             for node_id, s3 in artifact_map.items():
                 if s3.startswith(prefix_uri):
                     links.append(node_id)
-
             links = sorted(set(links))
-            
+
             # links가 없어도 테이블은 추가 (프론트에 표시하기 위해)
             tables.append({
                 "id": t_id,
@@ -284,7 +278,6 @@ async def fetch_schema_layer(
                 if sqlr.status_code == 200:
                     sql = sqlr.json() or {}
                     sql_tables = sql.get("steps", [])
-                    
                     # SQL에서 발견된 테이블 추가
                     for step in sql_tables:
                         dst = step.get("dst")
@@ -313,7 +306,6 @@ async def fetch_schema_layer(
                                 "links": [],
                                 "source": "sql",
                             })
-                    
                     # 기존 테이블 정보 보강
                     sql_tables_map = { t.get("dst"): t for t in sql_tables if t.get("dst") }
                     for t in tables:
@@ -323,7 +315,6 @@ async def fetch_schema_layer(
                         if st:
                             t["sql_step"] = st.get("step")
                             t["sql_file"] = st.get("file")
-                            
             except Exception as e:
                 warnings.append(f"sql lineage: {e}")
 
@@ -384,6 +375,50 @@ async def fetch_schema_layer(
 @app.get("/health")
 def health():
     return {"status": "ok", "version": app.version}
+
+# -----------------------------------------------------------------------------#
+# NEW) 스키마 집계 API (프론트의 /schema 호출 대응)
+#      - /schema 와 /lineage/schema 두 경로 모두 제공
+# -----------------------------------------------------------------------------#
+@app.get("/schema")
+async def api_schema(
+    request: Request,
+    pipeline: str = Query(...),
+    region: str = Query(...),
+    include_featurestore: bool = Query(True),
+    include_sql: bool = Query(True),
+    scan_if_missing: bool = Query(False),
+    timeout_s: float = Query(15.0, ge=3.0, le=120.0),
+):
+    return await fetch_schema_layer(
+        request=request,
+        pipeline=pipeline,
+        region=region,
+        include_featurestore=include_featurestore,
+        include_sql=include_sql,
+        scan_if_missing=scan_if_missing,
+        timeout_s=timeout_s,
+    )
+
+@app.get("/lineage/schema")
+async def api_lineage_schema(
+    request: Request,
+    pipeline: str = Query(...),
+    region: str = Query(...),
+    include_featurestore: bool = Query(True),
+    include_sql: bool = Query(True),
+    scan_if_missing: bool = Query(False),
+    timeout_s: float = Query(15.0, ge=3.0, le=120.0),
+):
+    return await api_schema(
+        request=request,
+        pipeline=pipeline,
+        region=region,
+        include_featurestore=include_featurestore,
+        include_sql=include_sql,
+        scan_if_missing=scan_if_missing,
+        timeout_s=timeout_s,
+    )
 
 # -----------------------------------------------------------------------------#
 # 1) pipelines: 파이프라인 목록 + 태그/도메인 매핑
