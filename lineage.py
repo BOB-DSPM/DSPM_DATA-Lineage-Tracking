@@ -1,17 +1,18 @@
-import argparse, json, sys, re, datetime as dt
+# --- file: lineage.py ---
+from __future__ import annotations
+
+import argparse, json, sys, re, datetime as dt, glob, os
 from typing import Dict, List, Any, Tuple, Optional
-from modules.sql_lineage_store import latest_by_step
+import requests
+from urllib.parse import quote as urlquote
 import boto3
 import botocore
+
+from modules.sql_lineage_store import latest_by_step
 
 # ---------------------------
 # Helpers (refs & S3 parsing)
 # ---------------------------
-
-import os
-import requests
-from urllib.parse import quote as urlquote
-
 
 _REF_RE = re.compile(r"Steps\.([A-Za-z0-9\-_]+)")
 _S3_RE  = re.compile(r"^s3://([^/]+)/?(.*)$")
@@ -315,7 +316,7 @@ def enrich_with_latest_execution(sm, pipeline_name: str, graph: Dict[str, Any]) 
     try:
         ex_summ = sm.list_pipeline_executions(
             PipelineName=pipeline_name, SortBy="CreationTime", SortOrder="Descending", MaxResults=1
-        ).get("PipelineExecutionSummaries", [])
+        ).get("PipelineExecutionSummaries", []) or []
         if not ex_summ:
             return
         exec_arn = ex_summ[0].get("PipelineExecutionArn")
@@ -545,6 +546,11 @@ def enrich_artifact_s3_meta(artifacts: List[Dict[str,Any]], session: boto3.sessi
         except Exception:
             pass
         a["s3"] = meta
+
+# ---------------------------
+# (5) Analyzer (PII) enrichment
+# ---------------------------
+
 _ANALYZER_API = os.getenv("ANALYZER_API", "http://43.202.228.52:9000")
 
 def _to_analyzer_source_key(s3_uri: str) -> Optional[str]:
@@ -672,6 +678,142 @@ def enrich_artifacts_with_pii_flags(artifacts: List[Dict[str, Any]]) -> None:
         }
 
 # ---------------------------
+# (6) Retention (보존기간 만료) enrichment
+# ---------------------------
+
+_RETENTION_RDS_REPORT = os.getenv("RETENTION_RDS_REPORT", "/var/result/rds_auto_scan_report.json")
+_RETENTION_XCHECK_REPORT = os.getenv("RETENTION_XCHECK_REPORT", "/var/result/cross_check_report.json")
+_RETENTION_MAX_IDS_PREVIEW = int(os.getenv("RETENTION_MAX_IDS_PREVIEW", "10"))
+
+def _safe_load_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _index_deleted_ids_from_rds_report(js: dict) -> set[str]:
+    """
+    rds_auto_scan_report.json에서 'deleted' 또는 'expired' 상태의 식별자 집합을 추출.
+    다양한 리포트 스키마를 방어적으로 처리.
+    """
+    ids: set[str] = set()
+    if not isinstance(js, dict):
+        return ids
+
+    items = js.get("items") or js.get("data") or []
+    if isinstance(items, list):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            idv = it.get("id") or it.get("user_id") or it.get("identifier") or it.get("record_id")
+            st  = (it.get("status") or it.get("state") or "").lower()
+            if idv and st in {"deleted", "expired", "removed"}:
+                ids.add(str(idv))
+    # 단순 배열 지원
+    for k in ("deleted_ids", "expired_ids", "removed_ids"):
+        arr = js.get(k)
+        if isinstance(arr, list):
+            for v in arr:
+                if v is not None:
+                    ids.add(str(v))
+    return ids
+
+def _index_s3_usage_from_xcheck(js: dict) -> dict[str, set[str]]:
+    """
+    cross_check_report.json에서 각 S3 객체/프리픽스가 사용한 식별자 집합을 인덱싱.
+    출력: { "s3://bucket/key" : {"id1","id2",...}, ... }
+    """
+    index: dict[str, set[str]] = {}
+    if not isinstance(js, (dict, list)):
+        return index
+
+    def _add(uri: str, ids: list):
+        if not uri:
+            return
+        uri = uri.strip()
+        if not uri.startswith("s3://"):
+            # 's3/bucket/key' 형태 폴백 지원
+            if uri.startswith("s3/"):
+                parts = uri[3:].split("/", 1)
+                if parts and len(parts) == 2:
+                    uri = f"s3://{parts[0]}/{parts[1]}"
+        if not uri.startswith("s3://"):
+            return
+        index.setdefault(uri, set()).update({str(x) for x in ids if x is not None})
+
+    # 형태 1: {"items":[{"file":"s3://...","matched_ids":[...]}, ...]}
+    if isinstance(js, dict):
+        items = js.get("items") or js.get("data") or []
+        if isinstance(items, list) and items:
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                uri = it.get("file") or it.get("source") or it.get("s3_uri")
+                ids = it.get("matched_ids") or it.get("ids") or it.get("identifiers") or []
+                if isinstance(ids, dict) and "items" in ids:
+                    ids = ids["items"]
+                if isinstance(ids, list):
+                    _add(uri, ids)
+        else:
+            # 형태 2: {"s3://...": {"ids":[...]}, ...}
+            for k, v in js.items():
+                if isinstance(v, dict):
+                    ids = v.get("ids") or v.get("matched_ids") or []
+                    if isinstance(ids, list):
+                        _add(k, ids)
+
+    # 형태 3: [ {"file":"s3://...","ids":[...]}, ... ]
+    if isinstance(js, list):
+        for it in js:
+            if isinstance(it, dict):
+                uri = it.get("file") or it.get("source") or it.get("s3_uri")
+                ids = it.get("matched_ids") or it.get("ids") or []
+                if isinstance(ids, list):
+                    _add(uri, ids)
+
+    return index
+
+def enrich_artifacts_with_retention(artifacts: list[dict]) -> None:
+    """
+    artifacts[*]에 retention 필드 추가:
+      retention: { "expired": bool, "matchedIds": [..], "sources": {...} }
+    - RDS 보고서에서 '삭제/만료' ID 목록 확보
+    - Cross-check 보고서에서 각 S3 URI가 사용한 ID 목록 확보
+    - 교집합이 있으면 expired=True
+    """
+    # 최신 파일 선택(글롭 패턴 고려 가능)
+    rds_paths = sorted(glob.glob(_RETENTION_RDS_REPORT), reverse=True) or [_RETENTION_RDS_REPORT]
+    xck_paths = sorted(glob.glob(_RETENTION_XCHECK_REPORT), reverse=True) or [_RETENTION_XCHECK_REPORT]
+
+    rds_js = None
+    for p in rds_paths:
+        rds_js = _safe_load_json(p)
+        if rds_js:
+            break
+    xck_js = None
+    for p in xck_paths:
+        xck_js = _safe_load_json(p)
+        if xck_js:
+            break
+
+    deleted_ids = _index_deleted_ids_from_rds_report(rds_js or {})
+    s3_usage    = _index_s3_usage_from_xcheck(xck_js or {})
+
+    for a in artifacts:
+        uri = a.get("uri")
+        used_ids = s3_usage.get(uri, set())
+        inter = used_ids.intersection(deleted_ids) if used_ids and deleted_ids else set()
+        a["retention"] = {
+            "expired": bool(inter),
+            "matchedIds": sorted(list(inter))[:_RETENTION_MAX_IDS_PREVIEW],
+            "sources": {
+                "rdsReport": bool(rds_js),
+                "crossCheckReport": bool(xck_js),
+            }
+        }
+
+# ---------------------------
 # pipelines with domain (for /sagemaker/pipelines, /lineage/by-domain)
 # ---------------------------
 
@@ -786,7 +928,7 @@ def get_lineage_json(
         pass
     enrich_artifact_s3_meta(graph_pipeline["artifacts"], session)
 
-    ### NEW: 여기서 PII 플래그 보강
+    ### NEW: 여기서 PII + Retention 플래그 보강
     if include_pii:
         try:
             enrich_artifacts_with_pii_flags(graph_pipeline["artifacts"])
@@ -794,8 +936,14 @@ def get_lineage_json(
             # 실패해도 전체 라인리지는 계속 반환
             for a in graph_pipeline.get("artifacts", []):
                 a.setdefault("pii", {"hasPII": False, "category": "unknown", "counts": {}, "detailUrl": None})
-            # (로그만 남기고 무시)
             print(f"[warn] pii enrichment failed: {e}")
+
+        try:
+            enrich_artifacts_with_retention(graph_pipeline["artifacts"])
+        except Exception as e:
+            for a in graph_pipeline.get("artifacts", []):
+                a.setdefault("retention", {"expired": False, "matchedIds": [], "sources": {}})
+            print(f"[warn] retention enrichment failed: {e}")
 
     # (3-2) 요약(파이프라인 기준)
     summary = pipeline_summary(graph_pipeline)
@@ -819,6 +967,7 @@ def get_lineage_json(
         result["graphData"] = graph_data
 
     return result
+
 # ---------------------------
 # Enrich nodes with SQL lineage info
 # ---------------------------
@@ -851,6 +1000,7 @@ def main():
     ap.add_argument("--profile", help="AWS 프로필명(선택)")
     ap.add_argument("--view", choices=["pipeline","data","both"], default="both")
     ap.add_argument("--out", help="JSON 파일로 저장 경로(선택)")
+    ap.add_argument("--include-pii", action="store_true", help="Analyzer/Retention 보강 포함")
     args = ap.parse_args()
 
     data = get_lineage_json(
@@ -860,6 +1010,7 @@ def main():
         include_latest_exec=args.include_latest_exec,
         profile=args.profile,
         view=args.view,
+        include_pii=args.include_pii,
     )
 
     text = json.dumps(data, indent=2, ensure_ascii=False)

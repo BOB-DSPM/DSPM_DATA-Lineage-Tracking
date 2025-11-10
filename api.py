@@ -1,18 +1,18 @@
 from __future__ import annotations
+
 from typing import Optional, List, Dict, Any, Tuple
+from pathlib import Path
+import os, re, json, shutil, asyncio
+
+import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
 from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
-from pydantic import BaseModel
-import os
-import boto3
+from pydantic import BaseModel, Field
 import uvicorn
-import shutil
-from urllib.parse import urljoin
-import asyncio
-import httpx, re
+import httpx
 
 # --- Internal modules ---
 from modules.schema_sampler import sample_schema, parse_s3_uri
@@ -23,13 +23,13 @@ from modules.sql_lineage_store import put, get_by_pipeline, get_by_job
 from modules.connectors.git_fetch import shallow_clone
 from modules.sql_try import try_parse
 
-# 순환 import 방지용 별칭 임포트
+# 순환 import 방지용 별칭 임포트 (lineage.py)
 import lineage as lineage_lib
 
 # -----------------------------------------------------------------------------#
 # FastAPI
 # -----------------------------------------------------------------------------#
-app = FastAPI(title="SageMaker Lineage API", version="1.5.1")
+app = FastAPI(title="SageMaker Lineage API", version="1.6.0")
 
 # CORS (운영 시 특정 도메인으로 제한 권장)
 app.add_middleware(
@@ -53,17 +53,6 @@ _BOTO_CFG = Config(
 # Utils
 # -----------------------------------------------------------------------------#
 S3_RE = re.compile(r"^s3://([^/]+)/?(.*)$")
-
-def parse_s3_uri(uri: str) -> Tuple[str, str]:
-    """
-    s3://bucket/prefix -> (bucket, prefix)
-    prefix가 없으면 '' 반환
-    """
-    m = S3_RE.match(uri or "")
-    if not m:
-        raise ValueError(f"Invalid S3 URI: {uri}")
-    bucket, prefix = m.group(1), m.group(2)
-    return bucket, prefix
 
 def data_node_id_from_uri(uri: str) -> str:
     # 프론트 데이터 노드 id 규칙에 맞춰 통일
@@ -153,21 +142,16 @@ async def fetch_schema_layer(
                 s3 = node_id[5:]
                 if is_data_uri(s3):
                     artifact_map[node_id] = s3
-                    print(f"[fetch_schema_layer] Mapped from node_id: {node_id} -> {s3}")
                 continue
 
             # uri 필드에서 추출
             uri = dn.get("uri")
             if is_data_uri(uri):
                 mapped_id = data_node_id_from_uri(uri)
-                artifact_map[data_node_id_from_uri(uri)] = uri
-                print(f"[fetch_schema_layer] Mapped from uri: {mapped_id} -> {uri}")
+                artifact_map[mapped_id] = uri
 
         # 후보 URI 정리
         uris = sorted(set(artifact_map.values()))
-        print(f"[fetch_schema_layer] Total unique URIs: {len(uris)}")
-        for uri in uris:
-            print(f"  - {uri}")
 
         # URI가 없어도 계속 진행 (SQL 라인리지에서 테이블 정보 가져올 수 있음)
         if not uris:
@@ -269,7 +253,6 @@ async def fetch_schema_layer(
                 fields = data["schema"].get("fields") or {}
                 raw_cols = []
                 for cname, meta in fields.items():
-                    # 필요 없으면 샘플/메타 필드 제외할 수도 있음
                     if cname in ("sampled_files",):
                         continue
                     ctype = None
@@ -302,30 +285,23 @@ async def fetch_schema_layer(
                     sql = sqlr.json() or {}
                     sql_tables = sql.get("steps", [])
                     
-                    # 🔥 SQL에서 발견된 테이블 추가
+                    # SQL에서 발견된 테이블 추가
                     for step in sql_tables:
                         dst = step.get("dst")
                         if not dst:
                             continue
-                        
                         t_name = dst.split(".")[-1]  # schema.table -> table
                         t_id = f"table:{t_name}"
-                        
-                        # 이미 추가된 테이블인지 확인
                         if any(t["id"] == t_id for t in tables):
                             continue
-                        
-                        # SQL에서만 발견된 테이블 추가
                         tables.append({
                             "id": t_id,
                             "name": t_name,
                             "version": None,
                             "links": [],
-                            "source": "sql",  # SQL에서 온 정보임을 표시
+                            "source": "sql",
                             "step": step.get("step"),
                         })
-                        
-                        # 컬럼 정보도 추가
                         for col_name in (step.get("columns") or []):
                             if not col_name:
                                 continue
@@ -367,7 +343,7 @@ async def fetch_schema_layer(
                             continue
                         detj = det.json() or {}
                         s3_uri = (detj.get("OfflineStoreConfig") or {}).get("S3StorageConfig", {}).get("ResolvedOutputS3Uri")
-                        links = [data_node_id_from_uri(s3_uri)] if is_data_uri(s3_uri) else []
+                        links = [data_node_id_from_uri(s3_uri)] if s3_uri and is_data_uri(s3_uri) else []
                         fg_id = f"featureGroup:{name}"
                         feature_groups.append({
                             "id": fg_id,
@@ -393,11 +369,6 @@ async def fetch_schema_layer(
         # id 기준으로 중복 제거
         tables = list({t["id"]: t for t in tables}.values())
         columns = list({c["id"]: c for c in columns}.values())
-        
-        # 디버깅 정보 추가
-        print(f"[schema] Pipeline: {pipeline}, Tables: {len(tables)}, Columns: {len(columns)}")
-        if tables:
-            print(f"[schema] Table names: {[t['name'] for t in tables]}")
 
         return {
             "tables": tables,
@@ -480,7 +451,7 @@ def lineage_endpoint(
     profile: str | None = Query(None, description="Local dev only; AWS profile name"),
     view: str = Query("both", regex="^(pipeline|data|both)$", description="pipeline | data | both"),
     ### NEW
-    includePII: bool = Query(False, description="Analyzer와 연동해 artifact별 PII 플래그/집계 포함"),
+    includePII: bool = Query(False, description="Analyzer와 Retention(삭제된 ID 교차점검) 포함"),
 ):
     try:
         data = lineage_lib.get_lineage_json(
@@ -490,7 +461,6 @@ def lineage_endpoint(
             include_latest_exec=includeLatestExec,
             profile=profile,
             view=view,
-            ### NEW
             include_pii=includePII,
         )
         return data
@@ -515,8 +485,7 @@ def lineage_by_domain(
     includeLatestExec: bool = Query(False),
     profile: str | None = Query(None),
     view: str = Query("both", regex="^(pipeline|data|both)$"),
-    ### NEW
-    includePII: bool = Query(False, description="Analyzer와 연동해 artifact별 PII 플래그/집계 포함"),
+    includePII: bool = Query(False, description="Analyzer+Retention 포함"),
 ):
     try:
         pipes = lineage_lib.list_pipelines_with_domain(region=region, profile=profile)
@@ -538,7 +507,6 @@ def lineage_by_domain(
                     include_latest_exec=includeLatestExec,
                     profile=profile,
                     view=view,
-                    ### NEW
                     include_pii=includePII,
                 )
                 results.append({"pipeline": name, "ok": True, "data": data})
@@ -550,6 +518,7 @@ def lineage_by_domain(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"by-domain error: {e}")
+
 # -----------------------------------------------------------------------------#
 # 4) Dataset schema endpoints
 # -----------------------------------------------------------------------------#
@@ -738,49 +707,164 @@ def task_sql_inline(req: InlineSqlReq):
         saved += 1
     return {"ok": True, "saved": saved, "pipeline": req.pipeline}
 
-@app.get("/lineage/schema", summary="Get Lineage Schema")
-async def get_lineage_schema(
-    request: Request,
-    pipeline: str = Query(..., description="SageMaker Pipeline name"),
-    region: str = Query("ap-northeast-2"),
-    include_featurestore: bool = Query(True),
-    include_sql: bool = Query(True),
-    scan_if_missing: bool = Query(False, description="true면 스키마 없을 때 자동 스캔 시도"),
-):
+# -----------------------------------------------------------------------------#
+# 9) v2 Scan Endpoints (RDS Auto / Cross-Check 저장 및 리포트)
+# -----------------------------------------------------------------------------#
+RESULT_DIR = os.getenv("SCAN_RESULT_DIR", "/var/result")
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+RDS_AUTO_PATH = os.getenv("RDS_AUTO_REPORT", os.path.join(RESULT_DIR, "rds_auto_scan_report.json"))
+XCHECK_PATH   = os.getenv("XCHECK_REPORT",   os.path.join(RESULT_DIR, "cross_check_report.json"))
+
+class RdsAutoReq(BaseModel):
+    collector_api: str = Field(..., description="예: http://43.202.228.52:8000")
+    default_user: str | None = "madeit"
+    default_password: str | None = "madeit1022!"
+    passwords: dict[str, str] | None = None
+
+class XcheckReq(BaseModel):
+    collector_api: str = Field(..., description="예: http://43.202.228.52:8000")
+    bucket_names: list[str] | None = None
+    file_extensions: list[str] | None = [".csv", ".json", ".jsonl"]
+    max_files_per_bucket: int | None = 100
+
+def _safe_load_json(path: str):
     try:
-        return await fetch_schema_layer(
-            request=request,
-            pipeline=pipeline,
-            region=region,
-            include_featurestore=include_featurestore,
-            include_sql=include_sql,
-            scan_if_missing=scan_if_missing,
-        )
-    except HTTPException:
-        raise
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _index_deleted_ids_from_rds_report(js: dict) -> set[str]:
+    # 동일 로직을 간단 복제 (lineage_lib에서 import해도 무방)
+    ids: set[str] = set()
+    if not isinstance(js, dict):
+        return ids
+    items = js.get("items") or js.get("data") or []
+    if isinstance(items, list):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            idv = it.get("id") or it.get("user_id") or it.get("identifier") or it.get("record_id")
+            st  = (it.get("status") or it.get("state") or "").lower()
+            if idv and st in {"deleted", "expired", "removed"}:
+                ids.add(str(idv))
+    for k in ("deleted_ids", "expired_ids", "removed_ids"):
+        arr = js.get(k)
+        if isinstance(arr, list):
+            for v in arr:
+                if v is not None:
+                    ids.add(str(v))
+    return ids
+
+def _index_s3_usage_from_xcheck(js: dict) -> dict[str, set[str]]:
+    index: dict[str, set[str]] = {}
+    if not isinstance(js, (dict, list)):
+        return index
+
+    def _add(uri: str, ids: list):
+        if not uri:
+            return
+        uri = uri.strip()
+        if not uri.startswith("s3://"):
+            if uri.startswith("s3/"):
+                parts = uri[3:].split("/", 1)
+                if parts and len(parts) == 2:
+                    uri = f"s3://{parts[0]}/{parts[1]}"
+        if not uri.startswith("s3://"):
+            return
+        index.setdefault(uri, set()).update({str(x) for x in ids if x is not None})
+
+    if isinstance(js, dict):
+        items = js.get("items") or js.get("data") or []
+        if isinstance(items, list) and items:
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                uri = it.get("file") or it.get("source") or it.get("s3_uri")
+                ids = it.get("matched_ids") or it.get("ids") or it.get("identifiers") or []
+                if isinstance(ids, dict) and "items" in ids:
+                    ids = ids["items"]
+                if isinstance(ids, list):
+                    _add(uri, ids)
+        else:
+            for k, v in js.items():
+                if isinstance(v, dict):
+                    ids = v.get("ids") or v.get("matched_ids") or []
+                    if isinstance(ids, list):
+                        _add(k, ids)
+
+    if isinstance(js, list):
+        for it in js:
+            if isinstance(it, dict):
+                uri = it.get("file") or it.get("source") or it.get("s3_uri")
+                ids = it.get("matched_ids") or it.get("ids") or []
+                if isinstance(ids, list):
+                    _add(uri, ids)
+
+    return index
+
+@app.post("/api/v2/scan/rds-auto")
+async def api_v2_scan_rds_auto(req: RdsAutoReq):
+    """
+    RDS에서 '삭제된(=보존만료)' ID 목록을 수집하여 로컬 리포트 저장
+    """
+    url = f"{req.collector_api.rstrip('/')}/api/v2/scan/rds-auto"
+    payload = req.model_dump()
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(url, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"collector error: {r.text}")
+        data = r.json()
+    try:
+        with open(RDS_AUTO_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"schema layer error: {e}")
-    
-@app.get("/schema", summary="Get Schema (Alias)")
-async def get_schema_alias(
-    request: Request,
-    pipeline: str = Query(...),
-    region: str = Query("ap-northeast-2"),
-    include_featurestore: bool = Query(True),
-    include_sql: bool = Query(True),
-    scan_if_missing: bool = Query(False),
-):
+        raise HTTPException(status_code=500, detail=f"save failed: {e}")
+    return {"ok": True, "saved": RDS_AUTO_PATH}
+
+@app.post("/api/v2/scan/cross-check")
+async def api_v2_scan_cross_check(req: XcheckReq):
     """
-    /schema 엔드포인트 (프론트와의 호환성을 위한 별칭)
+    S3에서 파일을 훑어 '삭제된 ID' 사용 여부 교차점검 → 로컬 리포트 저장
     """
-    return await fetch_schema_layer(
-        request=request,
-        pipeline=pipeline,
-        region=region,
-        include_featurestore=include_featurestore,
-        include_sql=include_sql,
-        scan_if_missing=scan_if_missing,
-    )
+    url = f"{req.collector_api.rstrip('/')}/api/v2/scan/cross-check"
+    payload = req.model_dump()
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        r = await client.post(url, json=payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"collector error: {r.text}")
+        data = r.json()
+    try:
+        with open(XCHECK_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"save failed: {e}")
+    return {"ok": True, "saved": XCHECK_PATH}
+
+@app.get("/api/v2/scan/cross-check/report")
+def api_v2_scan_cross_check_report():
+    """
+    저장된 RDS/교차점검 리포트를 함께 요약 반환
+    """
+    rds = _safe_load_json(RDS_AUTO_PATH) or {}
+    xc  = _safe_load_json(XCHECK_PATH) or {}
+
+    deleted_ids = _index_deleted_ids_from_rds_report(rds)
+    usage = _index_s3_usage_from_xcheck(xc)
+
+    affected = []
+    for uri, ids in usage.items():
+        inter = sorted(list(ids.intersection(deleted_ids)))
+        if inter:
+            affected.append({"s3": uri, "count": len(inter), "sample": inter[:10]})
+
+    summary = {
+        "deletedIdsTotal": len(deleted_ids),
+        "s3ObjectsChecked": len(usage),
+        "affectedObjects": len(affected),
+    }
+    return {"summary": summary, "affected": affected}
 
 # -----------------------------------------------------------------------------#
 # Entrypoint
