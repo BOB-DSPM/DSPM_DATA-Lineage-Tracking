@@ -709,8 +709,9 @@ def task_sql_inline(req: InlineSqlReq):
 
 # -----------------------------------------------------------------------------#
 # 9) v2 Scan Endpoints (RDS Auto / Cross-Check 저장 및 리포트)
+#    ⬇ 기본 저장 경로를 ./result 로 변경
 # -----------------------------------------------------------------------------#
-RESULT_DIR = os.getenv("SCAN_RESULT_DIR", "/var/result")
+RESULT_DIR = os.getenv("SCAN_RESULT_DIR", "./result")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 RDS_AUTO_PATH = os.getenv("RDS_AUTO_REPORT", os.path.join(RESULT_DIR, "rds_auto_scan_report.json"))
