@@ -588,14 +588,7 @@ def list_dataset_schema_versions(bucket: str, prefix: str):
     return [{"version": v["version"], "sampled_at": v["sampled_at"], "policy": v["policy"]} for v in vers]
 
 # -----------------------------------------------------------------------------#
-# 5) SQL 단건 파싱 테스트
-# -----------------------------------------------------------------------------#
-@app.post("/sql/lineage")
-def api_sql_lineage(sql: str = Query(...), dialect: str | None = Query(None)):
-    return try_parse(sql, dialect=dialect)
-
-# -----------------------------------------------------------------------------#
-# 6) Feature Store helpers
+# 5) Feature Store helpers
 # -----------------------------------------------------------------------------#
 @app.get("/featurestore/feature-groups")
 def api_list_feature_groups(
@@ -614,137 +607,33 @@ def api_describe_feature_group(
     return describe_feature_group(region=region, name=name, profile=profile)
 
 # -----------------------------------------------------------------------------#
-# 7) SQL 자동 수집 (repo_path or git_url)
+# 6) SQL 라인리지 조회 (단건 파싱 테스트는 제거)
 # -----------------------------------------------------------------------------#
-USE_SQL_AUTOCOLLECT = os.getenv("USE_SQL_AUTOCOLLECT", "true").lower() == "true"
-
-if USE_SQL_AUTOCOLLECT:
-
-    @app.post("/tasks/sql/refresh")
-    def refresh_sql_lineage(
-        # A) 기존 로컬 경로 방식
-        repo_path: str | None = Query(None, description="레포 루트 경로"),
-
-        # B) 원격 Git 방식
-        git_url: str | None = Query(None, description="Git HTTPS URL"),
-        branch: str = Query("main", description="Git branch"),
-        subdir: str | None = Query(None, description="Git sub-directory (예: models)"),
-        token: str | None = Query(None, description="Git token/PAT (필요 시)"),
-
-        # 공통
-        pipeline: str = Query(...),
-        job_id: str | None = Query(None),
-        dialect: str | None = Query(None),
-    ):
-        """
-        repo_path 또는 git_url 중 '하나'는 필수.
-        수집된 SQL은 try_parse → put() 으로 저장합니다.
-        """
-        if (repo_path is None) and (git_url is None):
-            raise HTTPException(status_code=400, detail="repo_path or git_url required")
-
-        tmp_dir: Path | None = None
-        try:
-            # 1) 소스 결정
-            if git_url:
-                tmp_dir = shallow_clone(git_url=git_url, branch=branch, subdir=subdir, token=token)
-                scan_root = str(tmp_dir)  # collect_from_repo는 str 경로 기대
-            else:
-                scan_root_path = Path(repo_path).expanduser().resolve()
-                if not scan_root_path.exists():
-                    raise HTTPException(status_code=404, detail=f"repo_path not found: {scan_root_path}")
-                scan_root = str(scan_root_path)
-
-            # 2) 수집 → 파싱 → 저장
-            items = collect_from_repo(scan_root)
-            saved = 0
-            for it in items:
-                parsed = try_parse(it.get("sql", ""), dialect=dialect)
-                if not parsed.get("ok"):
-                    continue
-                rec = {
-                    "pipeline": pipeline,
-                    "step": guess_step_from_path(it.get("file", ""), pipeline),
-                    "job_id": job_id,
-                    "file": it.get("file"),
-                    "sql": it.get("sql"),
-                    "parsed": parsed,
-                }
-                put(rec)
-                saved += 1
-
-            return {"ok": True, "saved": saved, "pipeline": pipeline}
-
-        finally:
-            # 3) 임시 깃 클론 디렉터리 정리
-            if tmp_dir and tmp_dir.exists():
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    @app.get("/jobs/{job_id}/sql-lineage")
-    def sql_lineage_by_job(job_id: str):
-        return {"ok": True, "job_id": job_id, "items": get_by_job(job_id)}
-
-    @app.get("/pipelines/{name}/sql-lineage")
-    def sql_lineage_by_pipeline(name: str):
-        rows = get_by_pipeline(name)
-        latest: dict[str, dict] = {}
-        for r in rows:
-            step = r.get("step")
-            cur = latest.get(step)
-            if (not cur) or r.get("ts", 0) > cur.get("ts", 0):
-                latest[step] = r
-        summary = []
-        for step, r in latest.items():
-            p = r.get("parsed", {})
-            summary.append({
-                "step": step,
-                "dst": p.get("dst"),
-                "sources": p.get("sources", []),
-                "columns": p.get("columns", []),
-                "file": r.get("file"),
-                "ts": r.get("ts"),
-            })
-        return {"ok": True, "pipeline": name, "steps": summary}
-
-# -----------------------------------------------------------------------------#
-# 8) 레포 없이 바로 체험: Inline SQL 파싱 저장
-# -----------------------------------------------------------------------------#
-class InlineSqlReq(BaseModel):
-    pipeline: str
-    sql: str | None = None
-    sql_list: List[str] | None = None
-    job_id: str | None = None
-    dialect: str | None = None
-
-@app.post("/tasks/sql/inline", summary="Parse & Store Inline SQL (no repo needed)")
-def task_sql_inline(req: InlineSqlReq):
-    payload: List[str] = []
-    if req.sql:
-        payload.append(req.sql)
-    if req.sql_list:
-        payload.extend(req.sql_list)
-    if not payload:
-        raise HTTPException(status_code=400, detail="sql or sql_list required")
-
-    saved = 0
-    for i, sql in enumerate(payload, start=1):
-        parsed = try_parse(sql, dialect=req.dialect)
-        if not parsed.get("ok"):
-            continue
-        put({
-            "pipeline": req.pipeline,
-            "job_id": req.job_id,
-            "step": f"inline::{i}",
-            "file": f"inline::{i}",
-            "sql": sql,
-            "parsed": parsed
+@app.get("/pipelines/{name}/sql-lineage")
+def sql_lineage_by_pipeline(name: str):
+    """파이프라인별 SQL 라인리지 조회"""
+    rows = get_by_pipeline(name)
+    latest: dict[str, dict] = {}
+    for r in rows:
+        step = r.get("step")
+        cur = latest.get(step)
+        if (not cur) or r.get("ts", 0) > cur.get("ts", 0):
+            latest[step] = r
+    summary = []
+    for step, r in latest.items():
+        p = r.get("parsed", {})
+        summary.append({
+            "step": step,
+            "dst": p.get("dst"),
+            "sources": p.get("sources", []),
+            "columns": p.get("columns", []),
+            "file": r.get("file"),
+            "ts": r.get("ts"),
         })
-        saved += 1
-    return {"ok": True, "saved": saved, "pipeline": req.pipeline}
+    return {"ok": True, "pipeline": name, "steps": summary}
 
 # -----------------------------------------------------------------------------#
-# 9) v2 Scan Endpoints (RDS Auto / Cross-Check 저장 및 리포트)
-#    ⬇ 기본 저장 경로를 ./result 로 변경
+# 7) v2 Scan Endpoints (RDS Auto / Cross-Check 저장 및 리포트)
 # -----------------------------------------------------------------------------#
 RESULT_DIR = os.getenv("SCAN_RESULT_DIR", "./result")
 os.makedirs(RESULT_DIR, exist_ok=True)
