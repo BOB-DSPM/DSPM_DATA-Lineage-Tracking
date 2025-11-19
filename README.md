@@ -148,6 +148,14 @@ GET /health
 }
 ```
 
+### IAM 역할 기반 권한 부여
+- **Amazon EKS**: 서비스 계정에 IAM 역할을 연결(IRSA)하고 위 정책을 첨부합니다.
+- **Amazon ECS / AWS Fargate**: 태스크 역할(Task Role)에 동일한 권한을 부여하면 컨테이너가 자동으로 임시 자격 증명을 수신합니다.
+- **Amazon EC2**: 인스턴스 프로파일에 정책을 연결하면 컨테이너가 메타데이터 서비스로부터 역할 자격 증명을 받아 사용합니다.
+- **로컬 개발**: `aws configure` 대신 `aws-vault`, AWS SSO, 혹은 임시 환경 변수를 통해 호스트에서만 자격 증명을 주입하고 컨테이너에는 자동 전달되도록 구성합니다.
+
+이러한 방식은 AWS Marketplace 컨테이너 요구 사항(비루트 실행, 고정 자격 증명 미포함, 최소 권한)과 보안 모범 사례를 동시에 만족시킵니다.
+
 ## 데이터 처리 흐름
 ```
 1. SQL 수집 (git_fetch.py / sql_collector.py)
@@ -200,19 +208,21 @@ const elements = [
 ## Docker 실행
 ```bash
 # 이미지 빌드
-docker build -t dspm-lineage .
+docker build -f dockerfile -t dspm-lineage .
 
-# 컨테이너 실행
+# IAM 역할이 연결된 환경(예: EC2 인스턴스 프로파일, ECS/Fargate 태스크 롤, EKS IRSA)에서 실행
 docker run -d \
   -p 8300:8300 \
-  -v ~/.aws:/root/.aws:ro \
-  -e AWS_DEFAULT_REGION=ap-northeast-2 \
+  -e AWS_REGION=ap-northeast-2 \
+  -e PORT=8300 \
   --name dspm-lineage \
   dspm-lineage
 
 # 로그 확인
 docker logs -f dspm-lineage
 ```
+
+> **중요**: 컨테이너 내부에서 `aws configure`를 실행하거나 고정 자격 증명을 복사하지 않습니다. IAM 역할 또는 AWS SSO 기반 임시 자격 증명만 사용하세요. 이미지는 기본적으로 비루트 사용자(`appuser`) 권한으로 uvicorn을 실행합니다.
 
 ## 테스트 예시
 ```bash

@@ -7,10 +7,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PORT=8300
 
-# (선택) 기본 유틸
+# 운영 시 필요한 유틸(헬스체크 curl + git clone)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl tini && \
-    rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    curl \
+    git \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
 
 # 비루트 유저
 RUN useradd -ms /bin/bash appuser
@@ -22,6 +25,8 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r /tmp/requirements
 
 # 앱 소스
 COPY api.py lineage.py ./
+COPY modules ./modules
+COPY demo_repo ./demo_repo
 
 # 권한
 RUN chown -R appuser:appuser /app
